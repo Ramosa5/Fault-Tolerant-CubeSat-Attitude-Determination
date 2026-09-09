@@ -1,0 +1,8 @@
+"""Physical constants used by the Phase-1 simulation."""
+
+MU_EARTH_KM3_S2 = 398600.4418
+R_EARTH_KM = 6378.137
+J2_EARTH = 1.08262668e-3
+OMEGA_EARTH_RAD_S = 7.2921150e-5
+AU_KM = 149_597_870.7
+SECONDS_PER_DAY = 86400.0
