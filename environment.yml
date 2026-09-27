@@ -1,0 +1,10 @@
+name: cubesat-orekit
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - orekit
+  - numpy
+  - pandas
+  - matplotlib
+  - pytest
