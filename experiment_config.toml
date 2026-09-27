@@ -6,6 +6,15 @@ results_root = "results"
 name = "cubesat_fdir"
 stop_on_error = true
 
+
+[visualization]
+# Publication-style plots adapted from the figures4papers conventions.
+enabled = true
+formats = ["png", "pdf"]
+dpi = 300
+font_size = 15
+axes_linewidth = 2.0
+
 [steps]
 unit_tests = true
 orbit_sanity = true

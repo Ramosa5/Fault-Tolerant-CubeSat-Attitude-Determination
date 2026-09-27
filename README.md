@@ -69,3 +69,9 @@ python -m src.experiments.run_phase6 --runs-per-class 100 --epochs 25 --force-da
 ```
 
 Outputs are stored under `data/results/phase6/` and `plots/phase6/`. The main table is `phase6_model_comparison.csv`.
+
+## Publication-quality plots
+
+The unified runner now creates publication-style figures for every enabled project phase. The style is implemented locally from the conventions documented by Chen Liu's `figures4papers` repository: https://github.com/ChenLiu-1996/figures4papers . The upstream repository documents an API and design conventions to implement/adapt per project, so no additional GitHub package installation is required.
+
+Each experiment stores PNG and vector PDF figures under the corresponding timestamped `results/.../<phase>/plots/` directory. See `VISUALIZATION_GUIDE.md`.
