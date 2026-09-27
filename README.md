@@ -3,6 +3,8 @@
 Reconstructed from the previously created Phase-1 specification and extended with an Orekit reference propagator.
 Both propagators intentionally use the same ideal two-body Keplerian model and constants; this verifies implementation consistency, not high-fidelity orbital accuracy.
 
+First freeze for tests
+
 ## Recommended installation (Windows/macOS/Linux)
 Install Miniconda/Anaconda, then from this folder:
 
