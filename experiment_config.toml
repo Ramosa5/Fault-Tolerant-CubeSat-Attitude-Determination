@@ -1,0 +1,104 @@
+# MASTER EXPERIMENT CONFIGURATION
+# Run every experiment with: python run_project.py
+
+[run]
+results_root = "results"
+name = "cubesat_fdir"
+stop_on_error = true
+
+[steps]
+unit_tests = true
+orbit_sanity = true
+orekit_verification = true
+attitude_sensors_ekf = true
+fault_campaign = true
+ml_training = true
+
+[orbit]
+altitude_m = 500000.0
+inclination_deg = 51.6
+raan_deg = 0.0
+phase_deg = 0.0
+sanity_orbits = 1.0
+samples_per_orbit = 360
+
+# Orekit cross-verification cases. Add/remove cases freely.
+[[orekit.cases]]
+name = "V1_nominal_1orbit"
+altitude_m = 500000.0
+inclination_deg = 51.6
+raan_deg = 0.0
+phase_deg = 0.0
+orbits = 1.0
+[[orekit.cases]]
+name = "V2_low_inclination"
+altitude_m = 500000.0
+inclination_deg = 10.0
+raan_deg = 40.0
+phase_deg = 15.0
+orbits = 1.0
+[[orekit.cases]]
+name = "V3_high_inclination"
+altitude_m = 500000.0
+inclination_deg = 97.0
+raan_deg = 120.0
+phase_deg = 90.0
+orbits = 1.0
+[[orekit.cases]]
+name = "V4_altitude_400km"
+altitude_m = 400000.0
+inclination_deg = 51.6
+raan_deg = 0.0
+phase_deg = 0.0
+orbits = 1.0
+[[orekit.cases]]
+name = "V5_altitude_700km"
+altitude_m = 700000.0
+inclination_deg = 51.6
+raan_deg = 0.0
+phase_deg = 0.0
+orbits = 1.0
+[[orekit.cases]]
+name = "V6_long_10orbits"
+altitude_m = 500000.0
+inclination_deg = 51.6
+raan_deg = 25.0
+phase_deg = 35.0
+orbits = 10.0
+
+[attitude]
+duration_s = 600.0
+dt_s = 0.1
+inertia_kg_m2 = [0.020, 0.025, 0.030]
+q0 = [1.0, 0.0, 0.0, 0.0]
+omega0_rad_s = [0.01, 0.015, -0.005]
+
+[sensors]
+seed = 42
+gyro_bias_rad_s = [0.0002, -0.00015, 0.0001]
+gyro_noise_std_rad_s = 0.00005
+vector_noise_std = 0.002
+
+[fault_campaign]
+duration_s = 600.0
+dt_s = 0.1
+fault_start_s = 200.0
+fault_end_s = 500.0
+seed_base = 100
+window_lengths = [1, 5, 10, 20, 50, 100]
+# fault:severity entries. healthy ignores severity.
+scenarios = ["healthy:medium", "gyro_bias:low", "gyro_bias:medium", "gyro_bias:high", "gyro_drift:medium", "gyro_noise:medium", "sun_noise:medium", "sun_dropout:low", "sun_dropout:high", "sun_loss:medium"]
+
+[ml]
+runs_per_class = 12
+duration_s = 300.0
+dt_s = 0.1
+epochs = 12
+window_lengths = [1, 5, 10, 20, 50, 100]
+models = ["mlp", "cnn", "gru"]
+dataset_seed = 20260927
+split_seed = 20260927
+train_stride = 5
+val_stride = 5
+test_stride = 1
+force_regenerate_dataset = true
