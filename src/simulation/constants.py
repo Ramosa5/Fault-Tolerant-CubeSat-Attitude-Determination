@@ -1,8 +1,4 @@
-"""Physical constants used by the Phase-1 simulation."""
-
-MU_EARTH_KM3_S2 = 398600.4418
-R_EARTH_KM = 6378.137
-J2_EARTH = 1.08262668e-3
-OMEGA_EARTH_RAD_S = 7.2921150e-5
-AU_KM = 149_597_870.7
-SECONDS_PER_DAY = 86400.0
+MU_EARTH = 3.986004418e14       # m^3/s^2
+R_EARTH = 6378137.0             # m (WGS84 equatorial radius, used consistently)
+DEFAULT_ALTITUDE = 500_000.0    # m
+DEFAULT_INCLINATION_DEG = 51.6
