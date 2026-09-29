@@ -15,6 +15,219 @@ dpi = 300
 font_size = 15
 axes_linewidth = 2.0
 
+
+[animation]
+# Interactive 3D orbit + attitude validation saved as self-contained HTML.
+enabled = true
+frame_stride = 20
+# Animation-only cap. If frame_stride would create more frames, it is increased automatically.
+max_frames = 600
+# Optional visualization window; use "none" to render the entire simulated interval.
+start_time_s = "none"
+end_time_s = "none"
+# Rendering-only downsampling for the dashed Earth ground track.
+ground_track_max_points = 900
+# "cdn" keeps each HTML small; use "directory" for offline HTML with one shared plotly.min.js.
+include_plotlyjs = "cdn"
+playback_frame_ms = 80
+# Optional compact video overview. Requires ffmpeg on PATH.
+save_mp4 = false
+mp4_fps = 20
+mp4_max_frames = 900
+mp4_dpi = 110
+vector_length_km = 900.0
+# Visual-only 3D CubeSat dimensions. Mesh geometry scales with scene zoom.
+satellite_visual_size_km = [140.0, 90.0, 90.0]
+# Make the Sun vector prominent and always identifiable.
+sun_vector_length_scale = 1.35
+sun_arrowhead_size_km = 140.0
+body_pointing_axis = "x"
+show_true_axes = true
+show_estimated_axes = true
+show_sun_vector = true
+show_mag_vector = true
+show_velocity_vector = true
+show_nadir_vector = true
+show_full_orbit = true
+# Earth geographic context for visual validation. Ground track uses ECI -> ECEF rotation.
+show_earth_graticule = true
+graticule_step_deg = 30.0
+show_lat_lon_labels = true
+show_ground_track = true
+ground_track_opacity = 0.38
+ground_track_width = 5
+ground_track_dash = "dash"
+ground_track_surface_offset_km = 10.0
+# Default used by generic animations; operational scenarios override this with their illumination epoch.
+earth_epoch_utc = "2026-01-01T00:00:00+00:00"
+
+[animation.phase4]
+enabled = true
+
+[animation.phase5]
+enabled = true
+# Scenario IDs from fault_campaign.scenarios to animate.
+scenario_ids = [0, 3, 8, 9]
+
+
+[scenario]
+# Select one end-to-end operational scenario. Future scenarios are added to the registry
+# and chosen here without changing the command used to launch the project.
+enabled = true
+active = "magnetic_sun_pointing_comparison"
+
+[scenarios.sun_pointing]
+duration_s = 600.0
+dt_s = 0.1
+pointing_axis = "x"
+initial_error_deg = 30.0
+omega0_rad_s = [0.0, 0.0, 0.0]
+inertia_kg_m2 = [0.020, 0.025, 0.030]
+# Constant ECI Sun vector for algorithm verification. Later this can be replaced by Orekit ephemeris.
+sun_vector_eci = [1.0, 0.2, 0.1]
+# Ideal-state PD controller for the first closed-loop validation scenario.
+kp = 0.002
+kd = 0.01
+max_torque_nm = 0.002
+settling_threshold_deg = 1.0
+settling_duration_s = 10.0
+
+[scenarios.sun_pointing.animation]
+enabled = true
+
+[scenarios.sun_pointing_comparison]
+# Closed-loop three-branch comparison using MEKF feedback in every main branch:
+# 1) healthy MEKF, 2) faulty Sun sensor + MEKF, 3) same fault + ML virtual Sun sensor + MEKF.
+duration_s = 3000.0
+dt_s = 0.1
+pointing_axis = "x"
+initial_error_deg = 30.0
+omega0_rad_s = [0.0, 0.0, 0.0]
+inertia_kg_m2 = [0.020, 0.025, 0.030]
+# Used only when illumination.sun_model = "constant".
+sun_vector_eci = [1.0, 0.2, 0.1]
+mag_vector_eci = [0.25, -0.10, 0.96]
+kp = 0.002
+kd = 0.01
+max_torque_nm = 0.002
+settling_threshold_deg = 1.0
+settling_duration_s = 10.0
+
+# Current recovery model reconstructs the Sun sensor, so supported comparison faults are:
+# sun_loss, sun_dropout, sun_noise
+fault_type = "sun_loss"
+fault_severity = "medium"
+fault_start_s = 250.0
+fault_end_s = 450.0
+fault_seed = 4501
+comparison_seed = 7301
+
+# The MEKF uses a larger measurement covariance for ML-reconstructed Sun vectors
+# so the filter does not treat a virtual measurement as equally precise as a real sensor.
+ml_virtual_sensor_noise_std = 0.01
+# Safety gate: ML candidate must agree with the gyro-propagated MEKF direction.
+ml_gate_deg = 2.0
+# Accepted candidates are blended conservatively with the MEKF propagated direction.
+ml_blend = 0.25
+
+
+[scenarios.sun_pointing_comparison.modes]
+# Operational ADCS state machine:
+# SUN_ACQUISITION -> SUN_POINTING -> ECLIPSE_DRIFT -> SUN_REACQUISITION -> SUN_POINTING
+# In ECLIPSE_DRIFT the Sun-pointing torque is exactly zero; MEKF continues with gyro + magnetometer.
+pointing_threshold_deg = 1.0
+pointing_hold_s = 10.0
+
+[scenarios.sun_pointing_comparison.illumination]
+# "analytic" gives a calendar-dependent changing ECI Sun direction using a compact
+# solar ephemeris. Use "constant" for the earlier algorithm-only sanity check.
+sun_model = "analytic"
+epoch_utc = "2026-01-01T00:00:00+00:00"
+# Physical Earth shadow calculated from the configured orbit and apparent Earth/Sun disks.
+eclipse_enabled = true
+# In full umbra a real Sun sensor has no direct Sun measurement.
+eclipse_sun_sensor_unavailable = true
+
+[scenarios.sun_pointing_comparison.virtual_sensor]
+# Physics-informed lightweight MLP virtual Sun sensor. Gyro propagation advances the
+# previous Sun vector; the MLP learns a bounded correction from magnetometer + gyro data.
+hidden = [48, 24]
+train_runs = 24
+train_duration_s = 40.0
+epochs = 18
+batch_size = 256
+seed = 8128
+
+[scenarios.sun_pointing_comparison.animation]
+enabled = true
+
+
+# PHYSICAL MAGNETORQUER-ONLY SUN-POINTING SCENARIO
+# This is the current high-fidelity AOCS case. The older ideal-torque scenarios remain available.
+[scenarios.magnetic_sun_pointing_comparison]
+duration_s = 6000.0
+dt_s = 0.1
+pointing_axis = "x"
+initial_error_deg = 30.0
+omega0_rad_s = [0.0, 0.0, 0.0]
+
+fault_type = "sun_loss"
+fault_severity = "medium"
+fault_start_s = 250.0
+fault_end_s = 450.0
+fault_seed = 4501
+comparison_seed = 7301
+ml_virtual_sensor_noise_std = 0.01
+ml_gate_deg = 2.0
+ml_blend = 0.25
+
+[scenarios.magnetic_sun_pointing_comparison.spacecraft]
+# Representative 3U-class defaults. Replace these with the mission spacecraft values.
+mass_kg = 4.0
+# Body dimensions [X,Y,Z] in metres. Here +X is the long/pointing axis.
+dimensions_m = [0.34, 0.10, 0.10]
+# If inertia_kg_m2 is omitted, inertia is calculated from mass and dimensions as a uniform box.
+
+[scenarios.magnetic_sun_pointing_comparison.magnetorquers]
+# Three orthogonal rods. 0.4 A m^2 corresponds to a real CubeTorquer-class actuator rating.
+max_dipole_am2 = [0.4, 0.4, 0.4]
+# First-order electrical dipole response.
+time_constant_s = 0.0065
+
+[scenarios.magnetic_sun_pointing_comparison.controller]
+# PD produces a desired body torque; magnetic allocation converts it to m_cmd using tau=m x B.
+kp = 8.0e-6
+kd = 3.0e-4
+desired_torque_limit_nm = 2.5e-5
+
+[scenarios.magnetic_sun_pointing_comparison.magnetic_field]
+# Thesis runs: IGRF-14 via ppigrf. Use "dipole" only for fast code smoke tests.
+model = "igrf14"
+
+[scenarios.magnetic_sun_pointing_comparison.disturbances]
+gravity_gradient = true
+
+[scenarios.magnetic_sun_pointing_comparison.modes]
+pointing_threshold_deg = 2.0
+pointing_hold_s = 20.0
+
+[scenarios.magnetic_sun_pointing_comparison.illumination]
+sun_model = "analytic"
+epoch_utc = "2026-01-01T00:00:00+00:00"
+eclipse_enabled = true
+eclipse_sun_sensor_unavailable = true
+
+[scenarios.magnetic_sun_pointing_comparison.virtual_sensor]
+hidden = [48, 24]
+train_runs = 24
+train_duration_s = 40.0
+epochs = 18
+batch_size = 256
+seed = 8128
+
+[scenarios.magnetic_sun_pointing_comparison.animation]
+enabled = true
+
 [steps]
 unit_tests = true
 orbit_sanity = true
@@ -22,6 +235,7 @@ orekit_verification = true
 attitude_sensors_ekf = true
 fault_campaign = true
 ml_training = true
+scenario = true
 
 [orbit]
 altitude_m = 500000.0

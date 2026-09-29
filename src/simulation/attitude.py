@@ -47,3 +47,20 @@ def rotational_energy(omega,inertia_diag):
 
 def angular_momentum_norm(omega,inertia_diag):
     I=np.diag(inertia_diag); return np.linalg.norm(omega@I,axis=1)
+
+def propagate_attitude_controlled(times_s, q0, omega0, inertia_diag, torque_callback):
+    """RK4 rigid-body propagation with a state/time-dependent body torque."""
+    t=np.asarray(times_s,float); I=np.diag(inertia_diag)
+    out=np.zeros((len(t),7)); torques=np.zeros((len(t),3))
+    out[0,:4]=quat_normalize(q0); out[0,4:]=omega0
+    def deriv(tt,state):
+        tau=np.asarray(torque_callback(float(tt),state[:4],state[4:]),float)
+        return _derivative(state,I,tau)
+    for k in range(len(t)-1):
+        h=t[k+1]-t[k]; s=out[k].copy(); tk=t[k]
+        k1=deriv(tk,s); k2=deriv(tk+h/2,s+h*k1/2)
+        k3=deriv(tk+h/2,s+h*k2/2); k4=deriv(tk+h,s+h*k3)
+        sn=s+h*(k1+2*k2+2*k3+k4)/6; sn[:4]=quat_normalize(sn[:4]); out[k+1]=sn
+        torques[k]=np.asarray(torque_callback(float(t[k]),s[:4],s[4:]),float)
+    torques[-1]=np.asarray(torque_callback(float(t[-1]),out[-1,:4],out[-1,4:]),float)
+    return out, torques

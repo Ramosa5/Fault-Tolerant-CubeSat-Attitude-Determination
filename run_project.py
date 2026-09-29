@@ -22,6 +22,8 @@ from src.visualization.publication import (
     PALETTE, DEFAULT_COLORS, FigureStyle, apply_publication_style, create_subplots,
     finalize_figure, make_trend, make_grouped_bar, make_heatmap, add_fault_span
 )
+from src.visualization.animation import create_orbit_attitude_animation
+from src.scenarios.registry import run_scenario, SCENARIOS
 
 CONFIG=ROOT/'experiment_config.toml'
 
@@ -42,6 +44,39 @@ def viz_options(cfg):
         'font_size':int(v.get('font_size',15)),
         'axes_linewidth':float(v.get('axes_linewidth',2.0)),
     }
+
+def animation_options(cfg):
+    a=cfg.get('animation',{})
+    return {
+        'enabled':bool(a.get('enabled',False)),
+        'frame_stride':int(a.get('frame_stride',20)),
+        'max_frames':int(a.get('max_frames',600)),
+        'start_time_s':None if str(a.get('start_time_s','none')).lower()=='none' else float(a.get('start_time_s')),
+        'end_time_s':None if str(a.get('end_time_s','none')).lower()=='none' else float(a.get('end_time_s')),
+        'ground_track_max_points':int(a.get('ground_track_max_points',900)),
+        'include_plotlyjs':a.get('include_plotlyjs','cdn'),
+        'playback_frame_ms':int(a.get('playback_frame_ms',80)),
+        'save_mp4':bool(a.get('save_mp4',False)),
+        'mp4_fps':int(a.get('mp4_fps',20)),
+        'mp4_max_frames':int(a.get('mp4_max_frames',900)),
+        'mp4_dpi':int(a.get('mp4_dpi',110)),
+        'vector_length_km':float(a.get('vector_length_km',900.0)),
+        'satellite_visual_size_km':tuple(float(x) for x in a.get('satellite_visual_size_km',[140.0,90.0,90.0])),
+        'sun_vector_length_scale':float(a.get('sun_vector_length_scale',1.35)),
+        'sun_arrowhead_size_km':float(a.get('sun_arrowhead_size_km',140.0)),
+        'body_pointing_axis':str(a.get('body_pointing_axis','x')),
+        'show_true_axes':bool(a.get('show_true_axes',True)),
+        'show_estimated_axes':bool(a.get('show_estimated_axes',True)),
+        'show_sun_vector':bool(a.get('show_sun_vector',True)),
+        'show_mag_vector':bool(a.get('show_mag_vector',True)),
+        'show_velocity_vector':bool(a.get('show_velocity_vector',True)),
+        'show_nadir_vector':bool(a.get('show_nadir_vector',True)),
+        'show_full_orbit':bool(a.get('show_full_orbit',True)),
+    }
+
+def _animation_kwargs(cfg):
+    a=animation_options(cfg)
+    return {k:v for k,v in a.items() if k!='enabled'}
 
 def savefig(fig, plots, name, cfg, pad=1.0):
     v=viz_options(cfg)
@@ -178,6 +213,19 @@ def attitude_run(cfg,out,plots):
         for i in range(3): ax.axhline(sensors['gyro_bias_true'][i],color=DEFAULT_COLORS[i],ls=':',lw=1.5)
         ax.set_xlabel('Time [s]'); ax.set_ylabel('Gyro bias [rad/s]'); ax.set_title('Phase 4: gyroscope bias estimation'); ax.legend(ncol=3)
         savefig(fig,plots,'phase4_mekf_gyroscope_bias_estimate_vs_true',cfg)
+    anim_cfg=cfg.get('animation',{})
+    if animation_options(cfg)['enabled'] and anim_cfg.get('phase4',{}).get('enabled',True):
+        animations=mkdir(out/'animations')
+        oc=cfg['orbit']
+        create_orbit_attitude_animation(
+            animations/'phase4_nominal_true_vs_estimated_orbit_attitude.html',
+            t, truth[:,:4], q,
+            altitude_m=oc['altitude_m'], inclination_deg=oc['inclination_deg'],
+            raan_deg=oc['raan_deg'], phase_deg=oc['phase_deg'],
+            sun_i=sensors['sun_i'], mag_i=sensors['mag_i'],
+            title='Phase 4 nominal orbit and attitude: true vs MEKF estimate',
+            **_animation_kwargs(cfg),
+        )
     return row
 
 def fault_run(cfg,out,plots):
@@ -199,6 +247,21 @@ def fault_run(cfg,out,plots):
             for ax in axes:
                 if fault!='healthy': add_fault_span(ax,f['fault_start_s'],f['fault_end_s'])
             savefig(fig,plots,f'fault_scenario_{rid:02d}_{fault}_{severity}_attitude_innovations_availability',cfg,pad=.8)
+        anim_cfg=cfg.get('animation',{})
+        phase5_cfg=anim_cfg.get('phase5',{})
+        selected=set(int(x) for x in phase5_cfg.get('scenario_ids',[]))
+        if animation_options(cfg)['enabled'] and phase5_cfg.get('enabled',True) and rid in selected:
+            animations=mkdir(out/'animations'); oc=cfg['orbit']
+            create_orbit_attitude_animation(
+                animations/f'phase5_scenario_{rid:02d}_{fault}_{severity}_orbit_attitude.html',
+                t, truth[:,:4], q,
+                altitude_m=oc['altitude_m'], inclination_deg=oc['inclination_deg'],
+                raan_deg=oc['raan_deg'], phase_deg=oc['phase_deg'],
+                sun_i=faulty['sun_i'], mag_i=faulty['mag_i'],
+                fault_name=fault, severity=severity, fault_start_s=f['fault_start_s'], fault_end_s=f['fault_end_s'],
+                title=f'Phase 5 scenario {rid}: {fault} ({severity}) orbit and attitude',
+                **_animation_kwargs(cfg),
+            )
     df=pd.DataFrame(rows); df.to_csv(out/'phase5_scenario_summary.csv',index=False); pd.concat(frames).to_csv(out/'phase5_sample_dataset.csv',index=False)
     if viz_options(cfg)['enabled']:
         labels=[f"{r.fault}\n{r.severity}" for _,r in df.iterrows()]
@@ -261,12 +324,19 @@ def ml_run(cfg,out,plots):
             savefig(fig,plots,'phase6_mean_detection_delay_by_fault_class_and_model',cfg)
     return {'experiments':len(res),'dataset_runs':len(manifest)}
 
+def scenario_run(cfg,out,plots):
+    sc=cfg.get('scenario',{})
+    name=sc.get('active','sun_pointing')
+    scenario_cfg=cfg.get('scenarios',{}).get(name,{})
+    result=run_scenario(name,scenario_cfg,cfg,out)
+    return {'active_scenario':name, **{k:v for k,v in result.items() if isinstance(v,(str,int,float,bool))}}
+
 def main():
     with open(CONFIG,'rb') as f: cfg=tomllib.load(f)
     v=viz_options(cfg); apply_publication_style(FigureStyle(font_size=v['font_size'],axes_linewidth=v['axes_linewidth']))
     stamp=datetime.now().strftime('%Y-%m-%d_%H-%M-%S'); run_dir=mkdir(ROOT/cfg['run']['results_root']/f'results_{stamp}'); shutil.copy2(CONFIG,run_dir/'config_used.toml')
-    manifest={'run_name':cfg['run']['name'],'started_at':datetime.now().isoformat(),'python':sys.version,'config':str(CONFIG),'visualization':v,'steps':{}}; (run_dir/'run_manifest.json').write_text(json.dumps(manifest,indent=2))
-    jobs=[('unit_tests',run_tests),('orbit_sanity',orbit_sanity),('orekit_verification',orekit_verify),('attitude_sensors_ekf',attitude_run),('fault_campaign',fault_run),('ml_training',ml_run)]
+    manifest={'run_name':cfg['run']['name'],'started_at':datetime.now().isoformat(),'python':sys.version,'config':str(CONFIG),'visualization':v,'animation':animation_options(cfg),'steps':{}}; (run_dir/'run_manifest.json').write_text(json.dumps(manifest,indent=2))
+    jobs=[('unit_tests',run_tests),('orbit_sanity',orbit_sanity),('orekit_verification',orekit_verify),('attitude_sensors_ekf',attitude_run),('fault_campaign',fault_run),('ml_training',ml_run),('scenario',scenario_run)]
     print(f'\nResults directory: {run_dir}\n')
     for name,fn in jobs:
         if not cfg['steps'].get(name,False): print(f'[SKIP] {name}'); manifest['steps'][name]={'status':'skipped'}; continue
