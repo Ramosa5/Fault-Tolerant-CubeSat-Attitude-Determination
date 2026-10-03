@@ -74,7 +74,7 @@ scenario_ids = [0, 3, 8, 9]
 # Select one end-to-end operational scenario. Future scenarios are added to the registry
 # and chosen here without changing the command used to launch the project.
 enabled = true
-active = "magnetic_sun_pointing_comparison"
+active = "reaction_wheel_fault_campaign"
 
 [scenarios.sun_pointing]
 duration_s = 600.0
@@ -182,10 +182,10 @@ ml_gate_deg = 2.0
 ml_blend = 0.25
 
 [scenarios.magnetic_sun_pointing_comparison.spacecraft]
-# Representative 3U-class defaults. Replace these with the mission spacecraft values.
-mass_kg = 4.0
-# Body dimensions [X,Y,Z] in metres. Here +X is the long/pointing axis.
-dimensions_m = [0.34, 0.10, 0.10]
+# 1U / 1 kg controller-development case. Replace with CAD-derived mission values later.
+mass_kg = 1.0
+# Body dimensions [X,Y,Z] in metres.
+dimensions_m = [0.10, 0.10, 0.10]
 # If inertia_kg_m2 is omitted, inertia is calculated from mass and dimensions as a uniform box.
 
 [scenarios.magnetic_sun_pointing_comparison.magnetorquers]
@@ -195,10 +195,63 @@ max_dipole_am2 = [0.4, 0.4, 0.4]
 time_constant_s = 0.0065
 
 [scenarios.magnetic_sun_pointing_comparison.controller]
-# PD produces a desired body torque; magnetic allocation converts it to m_cmd using tau=m x B.
+# Select "projected_pd" (baseline) or "magnetic_ltv" (finite-horizon LTV magnetic regulator).
+type = "magnetic_ltv"
+# "sun_orbit" constrains +X to Sun and +Z near the orbit normal, eliminating free roll.
+target_mode = "sun_orbit"
+# Backward-compatible PD gains are still used for the desired-torque baseline and diagnostics.
 kp = 8.0e-6
 kd = 3.0e-4
 desired_torque_limit_nm = 2.5e-5
+
+
+[scenarios.magnetic_sun_pointing_comparison.controller.ltv]
+# Finite-horizon LTV regulator. Future B directions enter the Riccati recursion.
+horizon_s = 120.0
+step_s = 5.0
+update_interval_s = 2.0
+regularization = 0.35
+max_compensation = 2.0
+
+[scenarios.magnetic_sun_pointing_comparison.controller.detumbling]
+# Default robust detumbling/eclipsed rate damping uses gyro rate feedback, while
+# still producing torque only through m x B. Set method = "bdot" to compare
+# against classical B-dot in a dedicated experiment.
+method = "rate_damping"
+rate_damping_kd_nm_per_rad_s = 3.0e-3
+rate_damping_torque_limit_nm = 1.0e-5
+bdot_gain_am2_s_per_t = 2.0e5
+bdot_deadband_t_per_s = 0.0
+bdot_filter_tau_s = 2.0
+
+[scenarios.magnetic_sun_pointing_comparison.controller.acquisition]
+# Acquisition emphasizes alignment but includes substantially stronger rate damping
+# than the original single-gain controller.
+kp = 6.0e-6
+kd = 8.0e-4
+desired_torque_limit_nm = 2.5e-5
+
+[scenarios.magnetic_sun_pointing_comparison.controller.reacquisition]
+kp = 6.0e-6
+kd = 8.0e-4
+desired_torque_limit_nm = 2.5e-5
+
+[scenarios.magnetic_sun_pointing_comparison.controller.pointing]
+# Lower proportional gain and stronger damping reduce target fly-through/overshoot.
+kp = 2.5e-6
+kd = 1.2e-3
+desired_torque_limit_nm = 1.5e-5
+
+# Orbit used by the three-branch physical fault/recovery experiment.
+# Options: "global", "iss_like", "high_beta_sunlit".
+orbit_profile = "high_beta_sunlit"
+
+[scenarios.magnetic_sun_pointing_comparison.high_beta_orbit]
+altitude_m = 550000.0
+inclination_deg = 97.6
+phase_deg = 0.0
+# "auto" selects RAAN from the Sun direction at illumination.epoch_utc to maximize |beta|.
+raan_mode = "auto"
 
 [scenarios.magnetic_sun_pointing_comparison.magnetic_field]
 # Thesis runs: IGRF-14 via ppigrf. Use "dipole" only for fast code smoke tests.
@@ -208,8 +261,17 @@ model = "igrf14"
 gravity_gradient = true
 
 [scenarios.magnetic_sun_pointing_comparison.modes]
+# SUN_POINTING is entered only if both the pointing error and body rate remain below
+# their thresholds for the corresponding hold times.
 pointing_threshold_deg = 2.0
 pointing_hold_s = 20.0
+rate_threshold_deg_s = 0.08
+rate_hold_s = 10.0
+# Above this rate, acquisition/reacquisition remains active but uses stronger internal damping.
+rate_recovery_trigger_deg_s = 0.20
+# Operational sequence:
+# DETUMBLING -> SUN_ACQUISITION -> SUN_POINTING ->
+# ECLIPSE_RATE_DAMPING -> SUN_REACQUISITION -> SUN_POINTING
 
 [scenarios.magnetic_sun_pointing_comparison.illumination]
 sun_model = "analytic"
@@ -228,13 +290,126 @@ seed = 8128
 [scenarios.magnetic_sun_pointing_comparison.animation]
 enabled = true
 
+# CONTROLLER × ORBIT ISOLATION EXPERIMENT
+# Healthy MEKF only: same sensor noise, same 1U spacecraft, four controller/orbit combinations.
+[scenarios.magnetic_control_orbit_matrix]
+duration_s = 6000.0
+dt_s = 0.1
+pointing_axis = "x"
+initial_error_deg = 30.0
+omega0_rad_s = [0.0, 0.0, 0.0]
+controllers = ["projected_pd", "magnetic_ltv"]
+orbit_profiles = ["iss_like", "high_beta_sunlit"]
+comparison_seed = 9107
+
+[scenarios.magnetic_control_orbit_matrix.spacecraft]
+mass_kg = 1.0
+dimensions_m = [0.10, 0.10, 0.10]
+
+[scenarios.magnetic_control_orbit_matrix.magnetorquers]
+max_dipole_am2 = [0.4, 0.4, 0.4]
+time_constant_s = 0.0065
+
+[scenarios.magnetic_control_orbit_matrix.controller]
+type = "projected_pd"
+target_mode = "sun_orbit"
+kp = 8.0e-6
+kd = 3.0e-4
+desired_torque_limit_nm = 2.5e-5
+
+[scenarios.magnetic_control_orbit_matrix.controller.ltv]
+horizon_s = 120.0
+step_s = 5.0
+update_interval_s = 2.0
+regularization = 0.35
+max_compensation = 2.0
+
+[scenarios.magnetic_control_orbit_matrix.controller.detumbling]
+method = "rate_damping"
+rate_damping_kd_nm_per_rad_s = 3.0e-3
+rate_damping_torque_limit_nm = 1.0e-5
+bdot_gain_am2_s_per_t = 2.0e5
+bdot_deadband_t_per_s = 0.0
+bdot_filter_tau_s = 2.0
+
+[scenarios.magnetic_control_orbit_matrix.controller.acquisition]
+kp = 6.0e-6
+kd = 8.0e-4
+desired_torque_limit_nm = 2.5e-5
+# Near-target capture/braking region used before SUN_POINTING handover.
+capture_error_deg = 0.0
+capture_kp = 2.0e-6
+capture_kd = 4.0e-3
+capture_torque_limit_nm = 1.2e-5
+
+[scenarios.magnetic_control_orbit_matrix.controller.reacquisition]
+kp = 6.0e-6
+kd = 8.0e-4
+desired_torque_limit_nm = 2.5e-5
+
+[scenarios.magnetic_control_orbit_matrix.controller.pointing]
+kp = 2.5e-6
+kd = 1.2e-3
+desired_torque_limit_nm = 1.5e-5
+
+# Dedicated steady Sun-hold law. It uses rate-priority damping and a bounded
+# leaky integral term to compensate persistent magnetic projection errors.
+[scenarios.magnetic_control_orbit_matrix.controller.hold]
+objective = "sun_primary"
+kp = 5.0e-6
+kd = 1.0e-2
+ki = 1.0e-8
+desired_torque_limit_nm = 1.8e-5
+integral_limit_rad_s = 8.0
+integral_leak_per_s = 0.02
+rate_priority_deg_s = 0.05
+rate_only_above_deg_s = 0.02
+rate_damping_kd = 2.0e-2
+# For +X Sun pointing, body-X error is roll about the Sun axis; de-emphasize it.
+error_weights = [0.10, 1.0, 1.0]
+
+[scenarios.magnetic_control_orbit_matrix.high_beta_orbit]
+altitude_m = 550000.0
+inclination_deg = 97.6
+phase_deg = 0.0
+raan_mode = "auto"
+
+[scenarios.magnetic_control_orbit_matrix.magnetic_field]
+model = "igrf14"
+
+[scenarios.magnetic_control_orbit_matrix.disturbances]
+gravity_gradient = true
+
+[scenarios.magnetic_control_orbit_matrix.modes]
+pointing_threshold_deg = 2.0
+pointing_hold_s = 20.0
+rate_threshold_deg_s = 0.08
+rate_hold_s = 10.0
+rate_recovery_trigger_deg_s = 0.20
+pointing_exit_threshold_deg = 10.0
+
+[scenarios.magnetic_control_orbit_matrix.illumination]
+sun_model = "analytic"
+epoch_utc = "2026-01-01T00:00:00+00:00"
+eclipse_enabled = true
+
+[scenarios.magnetic_control_orbit_matrix.animation]
+# Generate lightweight interactive 3D animations for matrix cases.
+enabled = true
+# "all" generates all four combinations. To limit output, use for example:
+# cases = ["high_beta_sunlit|magnetic_ltv"]
+cases = ["all"]
+eclipse_sun_sensor_unavailable = true
+
 [steps]
+# Diagnostic package default: run the controller × orbit matrix only.
+# Re-enable the earlier phases whenever you want the complete project pipeline.
 unit_tests = true
-orbit_sanity = true
-orekit_verification = true
-attitude_sensors_ekf = true
-fault_campaign = true
-ml_training = true
+orbit_sanity = false
+orekit_verification = false
+attitude_sensors_ekf = false
+fault_campaign = false
+ml_training = false
 scenario = true
 
 [orbit]
@@ -325,3 +500,195 @@ train_stride = 5
 val_stride = 5
 test_stride = 1
 force_regenerate_dataset = true
+
+
+[scenarios.reaction_wheel_sun_pointing_comparison]
+duration_s = 6000.0
+dt_s = 0.1
+pointing_axis = "x"
+initial_error_deg = 30.0
+omega0_rad_s = [0.0, 0.0, 0.0]
+
+fault_type = "sun_loss"
+fault_severity = "medium"
+fault_start_s = 250.0
+fault_end_s = 450.0
+fault_seed = 4501
+comparison_seed = 7301
+ml_virtual_sensor_noise_std = 0.01
+ml_gate_deg = 2.0
+ml_blend = 0.25
+orbit_profile = "high_beta_sunlit"
+
+[scenarios.reaction_wheel_sun_pointing_comparison.spacecraft]
+mass_kg = 1.0
+dimensions_m = [0.10, 0.10, 0.10]
+
+[scenarios.reaction_wheel_sun_pointing_comparison.reaction_wheels]
+# CubeSat-scale wheel sizing inspired by NanoSat/CubeSat-class hardware.
+max_torque_nm = [2.3e-4, 2.3e-4, 2.3e-4]
+max_momentum_nms = [1.77e-3, 1.77e-3, 1.77e-3]
+wheel_inertia_kg_m2 = [1.0e-6, 1.0e-6, 1.0e-6]
+max_speed_rpm = [6000.0, 6000.0, 6000.0]
+
+[scenarios.reaction_wheel_sun_pointing_comparison.magnetorquers]
+max_dipole_am2 = [0.2, 0.2, 0.2]
+time_constant_s = 0.0065
+
+[scenarios.reaction_wheel_sun_pointing_comparison.controller]
+[scenarios.reaction_wheel_sun_pointing_comparison.controller.acquisition]
+kp = 7.0e-4
+kd = 9.0e-3
+torque_limit_nm = 1.6e-4
+
+[scenarios.reaction_wheel_sun_pointing_comparison.controller.hold]
+kp = 3.0e-4
+kd = 8.0e-3
+torque_limit_nm = 8.0e-5
+use_full_attitude = true
+
+[scenarios.reaction_wheel_sun_pointing_comparison.controller.reacquisition]
+kp = 7.0e-4
+kd = 9.0e-3
+torque_limit_nm = 1.2e-4
+
+[scenarios.reaction_wheel_sun_pointing_comparison.controller.eclipse_hold]
+kd = 4.0e-3
+torque_limit_nm = 6.0e-5
+
+[scenarios.reaction_wheel_sun_pointing_comparison.controller.detumbling]
+bdot_gain_am2_s_per_t = 1.5e5
+bdot_deadband_t_per_s = 0.0
+bdot_filter_tau_s = 2.0
+
+[scenarios.reaction_wheel_sun_pointing_comparison.momentum_dumping]
+enabled = true
+start_fraction = 0.65
+stop_fraction = 0.35
+gain_per_s = 0.12
+torque_limit_nm = 5.0e-6
+
+[scenarios.reaction_wheel_sun_pointing_comparison.magnetic_field]
+model = "igrf14"
+
+[scenarios.reaction_wheel_sun_pointing_comparison.disturbances]
+gravity_gradient = true
+
+[scenarios.reaction_wheel_sun_pointing_comparison.modes]
+pointing_threshold_deg = 2.0
+pointing_hold_s = 15.0
+rate_threshold_deg_s = 0.08
+rate_hold_s = 8.0
+pointing_exit_threshold_deg = 5.0
+
+[scenarios.reaction_wheel_sun_pointing_comparison.illumination]
+sun_model = "analytic"
+epoch_utc = "2026-01-01T00:00:00+00:00"
+eclipse_enabled = true
+eclipse_sun_sensor_unavailable = true
+
+[scenarios.reaction_wheel_sun_pointing_comparison.virtual_sensor]
+hidden = [48, 24]
+train_runs = 24
+train_duration_s = 40.0
+epochs = 18
+batch_size = 256
+seed = 8128
+
+[scenarios.reaction_wheel_sun_pointing_comparison.animation]
+enabled = true
+
+
+# MULTI-SENSOR FAULT CAMPAIGN
+# Reuses the complete reaction-wheel spacecraft/AOCS definition above.
+# Each case is run as Healthy MEKF vs Faulty MEKF vs Faulty MEKF + ML recovery.
+[scenarios.reaction_wheel_fault_campaign]
+duration_s = 6000.0
+dt_s = 0.1
+orbit_profile = "global"
+seed = 9201
+animation_enabled = true
+# Selected representative animations; use ["all"] to animate every case.
+animation_cases = ["F0_baseline", "F3_sun_loss_large_gyro_bias", "F6_severe_estimator_corruption", "F8_sensor_blackout"]
+
+[[scenarios.reaction_wheel_fault_campaign.cases]]
+name = "F0_baseline"
+start_s = 1000.0
+end_s = 3000.0
+sun = { type = "none" }
+gyro = { type = "none" }
+mag = { type = "none" }
+
+[[scenarios.reaction_wheel_fault_campaign.cases]]
+name = "F1_sun_loss_600s"
+start_s = 1000.0
+end_s = 1600.0
+sun = { type = "sun_loss", severity = "high" }
+gyro = { type = "none" }
+mag = { type = "none" }
+
+[[scenarios.reaction_wheel_fault_campaign.cases]]
+name = "F2_sun_loss_2400s"
+start_s = 1000.0
+end_s = 3400.0
+sun = { type = "sun_loss", severity = "high" }
+gyro = { type = "none" }
+mag = { type = "none" }
+
+[[scenarios.reaction_wheel_fault_campaign.cases]]
+name = "F3_sun_loss_large_gyro_bias"
+start_s = 1000.0
+end_s = 3400.0
+sun = { type = "sun_loss", severity = "high" }
+# ~1.1, -0.8 and 0.6 deg/s additional bias: intentionally severe FDIR stress case.
+gyro = { type = "bias_step", bias_rad_s = [0.020, -0.014, 0.010] }
+mag = { type = "none" }
+
+[[scenarios.reaction_wheel_fault_campaign.cases]]
+name = "F4_sun_loss_gyro_stuck"
+start_s = 1000.0
+end_s = 3400.0
+sun = { type = "sun_loss", severity = "high" }
+gyro = { type = "stuck", value_rad_s = [0.018, -0.012, 0.008] }
+mag = { type = "none" }
+
+[[scenarios.reaction_wheel_fault_campaign.cases]]
+name = "F5_sun_loss_mag_misaligned"
+start_s = 1000.0
+end_s = 3400.0
+sun = { type = "sun_loss", severity = "high" }
+gyro = { type = "none" }
+mag = { type = "misalignment", angles_deg = [18.0, -14.0, 22.0] }
+
+[[scenarios.reaction_wheel_fault_campaign.cases]]
+name = "F6_severe_estimator_corruption"
+start_s = 1000.0
+end_s = 3600.0
+sun = { type = "sun_loss", severity = "high" }
+gyro = { type = "bias_step", bias_rad_s = [0.020, -0.014, 0.010] }
+mag = { type = "misalignment", angles_deg = [20.0, -16.0, 25.0] }
+
+[[scenarios.reaction_wheel_fault_campaign.cases]]
+name = "F7_stuck_gyro_stuck_mag"
+start_s = 1000.0
+end_s = 3600.0
+sun = { type = "sun_loss", severity = "high" }
+gyro = { type = "stuck", value_rad_s = [0.020, -0.015, 0.010] }
+mag = { type = "stuck", body_vector = [1.0, 0.0, 0.0] }
+
+[[scenarios.reaction_wheel_fault_campaign.cases]]
+name = "F8_sensor_blackout"
+start_s = 1000.0
+end_s = 2200.0
+sun = { type = "sun_loss", severity = "high" }
+# Flight-software fallback is zero rate when gyro data is declared unavailable.
+gyro = { type = "loss", fallback_rad_s = [0.0, 0.0, 0.0] }
+mag = { type = "loss" }
+
+[[scenarios.reaction_wheel_fault_campaign.cases]]
+name = "F9_intermittent_combined"
+start_s = 1000.0
+end_s = 3600.0
+sun = { type = "sun_dropout", severity = "high" }
+gyro = { type = "noise", noise_std_rad_s = 0.010 }
+mag = { type = "dropout", probability = 0.75 }

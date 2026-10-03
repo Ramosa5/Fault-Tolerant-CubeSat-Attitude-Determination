@@ -351,6 +351,7 @@ def create_orbit_attitude_animation(
     position_eci_m=None,
     velocity_eci_mps=None,
     mode_series=None,
+    body_rate_deg_s=None,
 ):
     """Create an interactive Plotly HTML animation of orbit + attitude.
 
@@ -413,6 +414,9 @@ def create_orbit_attitude_animation(
     modes = None if mode_series is None else np.asarray(mode_series, dtype=object)
     if modes is not None and len(modes) != len(t):
         raise ValueError('mode_series must match times_s length')
+    body_rate = None if body_rate_deg_s is None else np.asarray(body_rate_deg_s, dtype=float)
+    if body_rate is not None and len(body_rate) != len(t):
+        raise ValueError('body_rate_deg_s must match times_s length')
     if len(eclipse) != len(t):
         raise ValueError('eclipse_mask must match times_s length')
     baxis = _AXIS[body_pointing_axis.lower()]
@@ -551,6 +555,8 @@ def create_orbit_attitude_animation(
         annotation += f'<br>illumination = {"ECLIPSE" if eclipse[k] else "sunlight"}'
         if modes is not None:
             annotation += f'<br>ADCS mode = {modes[k]}'
+        if body_rate is not None:
+            annotation += f'<br>body rate = {body_rate[k]:.4f}°/s'
         if fault_name is not None:
             annotation += f'<br>fault = {fault_name}'
             if severity is not None:
@@ -584,6 +590,8 @@ def create_orbit_attitude_animation(
     initial_annotation += '<br>CubeSat body size = visualization scale'
     if modes is not None:
         initial_annotation += f'<br>ADCS mode = {modes[idx[0]]}'
+    if body_rate is not None:
+        initial_annotation += f'<br>body rate = {body_rate[idx[0]]:.4f}°/s'
     fig = go.Figure(data=static+dynamic0, frames=frames)
     fig.update_layout(
         title=title,

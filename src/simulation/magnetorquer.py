@@ -40,3 +40,29 @@ def first_order_dipole_response(previous_am2, command_am2, dt_s, time_constant_s
         return command.copy()
     alpha = 1.0 - np.exp(-float(dt_s) / tau)
     return previous + alpha * (command - previous)
+
+
+def bdot_dipole_command(current_field_body_t, previous_field_body_t, dt_s,
+                        gain_am2_s_per_t=1.0e6, max_dipole_am2=0.4,
+                        deadband_t_per_s=0.0):
+    """Classical B-dot magnetic rate damping command.
+
+    m = -k_B * dB_body/dt.  The command is clipped independently per body axis.
+    ``gain_am2_s_per_t`` therefore has units A m^2 s / T.
+    """
+    B = np.asarray(current_field_body_t, float)
+    Bprev = np.asarray(previous_field_body_t, float)
+    dt = float(dt_s)
+    if dt <= 0:
+        raise ValueError('dt_s must be positive')
+    bdot = (B - Bprev) / dt
+    db = float(deadband_t_per_s)
+    if db > 0:
+        bdot = np.where(np.abs(bdot) < db, 0.0, bdot)
+    m = -float(gain_am2_s_per_t) * bdot
+    lim = np.asarray(max_dipole_am2, dtype=float)
+    if lim.shape == ():
+        lim = np.repeat(float(lim), 3)
+    if lim.shape != (3,) or np.any(lim <= 0):
+        raise ValueError('max_dipole_am2 must be positive scalar or length-3 vector')
+    return np.clip(m, -lim, lim), bdot

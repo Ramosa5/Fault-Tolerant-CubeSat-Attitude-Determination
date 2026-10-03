@@ -1,7 +1,11 @@
 from __future__ import annotations
 from pathlib import Path
 from datetime import datetime
-import json, shutil, subprocess, sys, time, traceback, tomllib
+import json, shutil, subprocess, sys, time, traceback
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11 compatibility
+    import tomli as tomllib
 import xml.etree.ElementTree as ET
 import numpy as np, pandas as pd
 

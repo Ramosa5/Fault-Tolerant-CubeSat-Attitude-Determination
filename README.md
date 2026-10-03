@@ -3,8 +3,6 @@
 Reconstructed from the previously created Phase-1 specification and extended with an Orekit reference propagator.
 Both propagators intentionally use the same ideal two-body Keplerian model and constants; this verifies implementation consistency, not high-fidelity orbital accuracy.
 
-First freeze for tests
-
 ## Recommended installation (Windows/macOS/Linux)
 Install Miniconda/Anaconda, then from this folder:
 
@@ -77,3 +75,25 @@ Outputs are stored under `data/results/phase6/` and `plots/phase6/`. The main ta
 The unified runner now creates publication-style figures for every enabled project phase. The style is implemented locally from the conventions documented by Chen Liu's `figures4papers` repository: https://github.com/ChenLiu-1996/figures4papers . The upstream repository documents an API and design conventions to implement/adapt per project, so no additional GitHub package installation is required.
 
 Each experiment stores PNG and vector PDF figures under the corresponding timestamped `results/.../<phase>/plots/` directory. See `VISUALIZATION_GUIDE.md`.
+## Interactive orbit + attitude validation
+
+The configurable runner also supports self-contained Plotly HTML animations showing the CubeSat orbit, true and estimated body axes, configurable boresight direction, Sun/magnetic references, velocity and nadir vectors. Configure `[animation]` in `experiment_config.toml`; see `ANIMATION_GUIDE.md`.
+
+
+## Physical AOCS scenario (magnetorquer-only)
+
+The selectable `magnetic_sun_pointing_comparison` scenario adds spacecraft mass/geometry, derived rigid-body inertia, gravity-gradient torque, a time-varying geomagnetic field, and three orthogonal magnetorquers. The controller no longer applies arbitrary torque: it requests a PD torque, converts only the achievable component to magnetic dipole, clips it to the configured actuator rating, applies first-order actuator dynamics, and propagates the spacecraft using `tau = m x B`.
+
+For IGRF-14 install the additional pure-Python dependency once:
+
+```bash
+pip install ppigrf
+```
+
+Then select the scenario in `experiment_config.toml` and run the usual command:
+
+```bash
+python run_project.py
+```
+
+The included 4 kg / 0.34 x 0.10 x 0.10 m spacecraft and 0.4 A m^2 magnetorquers are representative defaults, not mission-specific values. Replace them with the actual spacecraft mass properties and actuator datasheet values before treating results as mission predictions.
