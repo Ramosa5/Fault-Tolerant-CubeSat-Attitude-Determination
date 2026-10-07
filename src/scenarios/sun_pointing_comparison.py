@@ -42,14 +42,15 @@ def _sensor_measurement(q, omega, gyro_bias, gyro_noise, sun_noise, mag_noise, s
     return g, s, m
 
 
-def _apply_sun_fault(z, fault_type, severity, active, rng):
+def _apply_sun_fault(z, fault_type, severity, active, rng, probability=None):
     if not active:
         return z.copy(), False
     lev = {'low': 1.0, 'medium': 2.0, 'high': 4.0}[severity]
     if fault_type == 'sun_loss':
         return np.full(3, np.nan), True
     if fault_type == 'sun_dropout':
-        if rng.random() < min(.15 * lev, .75):
+        p = min(.15 * lev, .75) if probability is None else float(probability)
+        if rng.random() < np.clip(p, 0.0, 1.0):
             return np.full(3, np.nan), True
         return z.copy(), False
     if fault_type == 'sun_noise':

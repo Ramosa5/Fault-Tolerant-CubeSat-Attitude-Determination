@@ -18,7 +18,7 @@ axes_linewidth = 2.0
 
 [animation]
 # Interactive 3D orbit + attitude validation saved as self-contained HTML.
-enabled = true
+enabled = false
 frame_stride = 20
 # Animation-only cap. If frame_stride would create more frames, it is increased automatically.
 max_frames = 600
@@ -74,7 +74,7 @@ scenario_ids = [0, 3, 8, 9]
 # Select one end-to-end operational scenario. Future scenarios are added to the registry
 # and chosen here without changing the command used to launch the project.
 enabled = true
-active = "reaction_wheel_fault_campaign"
+active = "reaction_wheel_fair_ml_campaign"
 
 [scenarios.sun_pointing]
 duration_s = 600.0
@@ -587,6 +587,19 @@ epoch_utc = "2026-01-01T00:00:00+00:00"
 eclipse_enabled = true
 eclipse_sun_sensor_unavailable = true
 
+
+[scenarios.reaction_wheel_sun_pointing_comparison.ml_recovery_gate]
+enabled = true
+sun_max_disagreement_deg = 12.0
+mag_max_disagreement_deg = 15.0
+gyro_max_disagreement_rad_s = 0.025
+gyro_cross_sensor_max_disagreement_deg = 8.0
+gyro_cross_sensor_min_references = 1
+gyro_fallback_decay_tau_s = 20.0
+gyro_vector_rate_window_s = 1.0
+gyro_vector_rate_blend = 0.5
+gyro_vector_rate_limit_rad_s = 0.05
+
 [scenarios.reaction_wheel_sun_pointing_comparison.virtual_sensor]
 hidden = [48, 24]
 train_runs = 24
@@ -692,3 +705,419 @@ end_s = 3600.0
 sun = { type = "sun_dropout", severity = "high" }
 gyro = { type = "noise", noise_std_rad_s = 0.010 }
 mag = { type = "dropout", probability = 0.75 }
+
+
+[[scenarios.reaction_wheel_fault_campaign.cases]]
+name = "F10_gyro_bias_only"
+start_s = 1000.0
+end_s = 3000.0
+sun = { type = "none" }
+gyro = { type = "bias_step", bias_rad_s = [0.012, -0.009, 0.007] }
+mag = { type = "none" }
+
+[[scenarios.reaction_wheel_fault_campaign.cases]]
+name = "F11_gyro_loss_only"
+start_s = 1000.0
+end_s = 3000.0
+sun = { type = "none" }
+gyro = { type = "loss", fallback_rad_s = [0.0, 0.0, 0.0] }
+mag = { type = "none" }
+
+[[scenarios.reaction_wheel_fault_campaign.cases]]
+name = "F12_mag_misalignment_only"
+start_s = 1000.0
+end_s = 3000.0
+sun = { type = "none" }
+gyro = { type = "none" }
+mag = { type = "misalignment", angles_deg = [20.0, -16.0, 25.0] }
+
+[[scenarios.reaction_wheel_fault_campaign.cases]]
+name = "F13_mag_loss_only"
+start_s = 1000.0
+end_s = 3000.0
+sun = { type = "none" }
+gyro = { type = "none" }
+mag = { type = "loss" }
+
+[[scenarios.reaction_wheel_fault_campaign.cases]]
+name = "F14_sun_loss_plus_mag_loss"
+start_s = 1000.0
+end_s = 3000.0
+sun = { type = "sun_loss", severity = "high" }
+gyro = { type = "none" }
+mag = { type = "loss" }
+
+
+[scenarios.reaction_wheel_ml_model_campaign]
+duration_s = 6000.0
+dt_s = 0.1
+orbit_profile = "global"
+magnetic_field_model = "igrf14"
+seed = 9311
+animation_enabled = true
+animation_cases = ["G2_gyro_bias_0p003", "G5_gyro_loss", "M2_mag_misalignment_10deg", "C1_moderate_gyro_bias_mag_misalignment"]
+
+[scenarios.reaction_wheel_ml_model_campaign.models]
+window = 20
+train_runs = 24
+train_duration_s = 40.0
+epochs = 18
+batch_size = 256
+seed = 93001
+
+# Recovery Architecture v2 experiment matrix.
+# These cases are used by reaction_wheel_ml_model_campaign instead of the older
+# stress-test campaign so that severity trends can be quantified cleanly.
+[[scenarios.reaction_wheel_ml_model_campaign.cases]]
+name = "R0_baseline"
+start_s = 1000.0
+end_s = 3000.0
+sun = { type = "none" }
+gyro = { type = "none" }
+mag = { type = "none" }
+
+[[scenarios.reaction_wheel_ml_model_campaign.cases]]
+name = "R1_sun_loss_control"
+start_s = 1000.0
+end_s = 3000.0
+sun = { type = "sun_loss", severity = "high" }
+gyro = { type = "none" }
+mag = { type = "none" }
+
+[[scenarios.reaction_wheel_ml_model_campaign.cases]]
+name = "G1_gyro_bias_0p001"
+start_s = 1000.0
+end_s = 3000.0
+sun = { type = "none" }
+gyro = { type = "bias_step", bias_rad_s = [0.001, -0.0007, 0.0005] }
+mag = { type = "none" }
+
+[[scenarios.reaction_wheel_ml_model_campaign.cases]]
+name = "G2_gyro_bias_0p003"
+start_s = 1000.0
+end_s = 3000.0
+sun = { type = "none" }
+gyro = { type = "bias_step", bias_rad_s = [0.003, -0.0021, 0.0015] }
+mag = { type = "none" }
+
+[[scenarios.reaction_wheel_ml_model_campaign.cases]]
+name = "G3_gyro_bias_0p006"
+start_s = 1000.0
+end_s = 3000.0
+sun = { type = "none" }
+gyro = { type = "bias_step", bias_rad_s = [0.006, -0.0042, 0.0030] }
+mag = { type = "none" }
+
+[[scenarios.reaction_wheel_ml_model_campaign.cases]]
+name = "G4_gyro_bias_0p012"
+start_s = 1000.0
+end_s = 3000.0
+sun = { type = "none" }
+gyro = { type = "bias_step", bias_rad_s = [0.012, -0.0084, 0.0060] }
+mag = { type = "none" }
+
+[[scenarios.reaction_wheel_ml_model_campaign.cases]]
+name = "G5_gyro_loss"
+start_s = 1000.0
+end_s = 3000.0
+sun = { type = "none" }
+gyro = { type = "loss", fallback_rad_s = [0.0, 0.0, 0.0] }
+mag = { type = "none" }
+
+[[scenarios.reaction_wheel_ml_model_campaign.cases]]
+name = "M1_mag_misalignment_5deg"
+start_s = 1000.0
+end_s = 3000.0
+sun = { type = "none" }
+gyro = { type = "none" }
+mag = { type = "misalignment", angles_deg = [5.0, -3.0, 4.0] }
+
+[[scenarios.reaction_wheel_ml_model_campaign.cases]]
+name = "M2_mag_misalignment_10deg"
+start_s = 1000.0
+end_s = 3000.0
+sun = { type = "none" }
+gyro = { type = "none" }
+mag = { type = "misalignment", angles_deg = [10.0, -7.0, 8.0] }
+
+[[scenarios.reaction_wheel_ml_model_campaign.cases]]
+name = "M3_mag_misalignment_20deg"
+start_s = 1000.0
+end_s = 3000.0
+sun = { type = "none" }
+gyro = { type = "none" }
+mag = { type = "misalignment", angles_deg = [20.0, -14.0, 16.0] }
+
+[[scenarios.reaction_wheel_ml_model_campaign.cases]]
+name = "M4_mag_misalignment_30deg"
+start_s = 1000.0
+end_s = 3000.0
+sun = { type = "none" }
+gyro = { type = "none" }
+mag = { type = "misalignment", angles_deg = [30.0, -21.0, 24.0] }
+
+[[scenarios.reaction_wheel_ml_model_campaign.cases]]
+name = "M5_mag_loss"
+start_s = 1000.0
+end_s = 3000.0
+sun = { type = "none" }
+gyro = { type = "none" }
+mag = { type = "loss" }
+
+[[scenarios.reaction_wheel_ml_model_campaign.cases]]
+name = "C1_moderate_gyro_bias_mag_misalignment"
+start_s = 1000.0
+end_s = 3000.0
+sun = { type = "none" }
+gyro = { type = "bias_step", bias_rad_s = [0.003, -0.0021, 0.0015] }
+mag = { type = "misalignment", angles_deg = [10.0, -7.0, 8.0] }
+
+[[scenarios.reaction_wheel_ml_model_campaign.cases]]
+name = "C2_sun_loss_moderate_gyro_bias"
+start_s = 1000.0
+end_s = 3000.0
+sun = { type = "sun_loss", severity = "high" }
+gyro = { type = "bias_step", bias_rad_s = [0.003, -0.0021, 0.0015] }
+mag = { type = "none" }
+
+[[scenarios.reaction_wheel_ml_model_campaign.cases]]
+name = "C3_sun_loss_mag_misalignment"
+start_s = 1000.0
+end_s = 3000.0
+sun = { type = "sun_loss", severity = "high" }
+gyro = { type = "none" }
+mag = { type = "misalignment", angles_deg = [10.0, -7.0, 8.0] }
+
+
+# ============================================================================
+# FAIR 3 x 3 ML COMPARISON CAMPAIGN
+# MLP / 1D CNN / GRU x sensor-only / orbital-context / physics-residual.
+# All architectures within a variant use EXACTLY the same generated trajectories,
+# complete-run train/validation/test split, windows, training fault realizations,
+# sample indices and fitted normalization. Primary pointing metrics are evaluated
+# only while the injected fault is active AND the Sun is physically visible.
+# ============================================================================
+[scenarios.reaction_wheel_fair_ml_campaign]
+duration_s = 4000.0
+dt_s = 0.1
+seed = 99501
+orbit_profile = "global"
+magnetic_field_model = "igrf14"
+plots_enabled = true
+
+[scenarios.reaction_wheel_fair_ml_campaign.metrics]
+# A Sun-pointing sample is primary only above this physical illumination fraction.
+sunlight_min_illumination = 0.05
+recovery_threshold_deg = 2.0
+recovery_hold_s = 10.0
+
+[scenarios.reaction_wheel_fair_ml_campaign.animation]
+# Disabled for the large comparison campaign. Turn on later without code changes.
+enabled = false
+cases = []
+
+[scenarios.reaction_wheel_fair_ml_campaign.models]
+architectures = ["mlp", "cnn", "gru"]
+variants = ["sensor_only", "orbital_context", "physics_residual"]
+targets = ["gyro", "sun", "mag"]
+window = 20
+# Saving the common NPZ is optional; the manifest is always saved.
+save_shared_dataset_npz = false
+
+[scenarios.reaction_wheel_fair_ml_campaign.models.dataset]
+# One dataset is generated ONCE and reused by all 27 trained networks.
+runs = 30
+duration_s = 50.0
+dt_s = 0.1
+window = 20
+seed = 97001
+split_seed = 97018
+train_fraction = 0.70
+validation_fraction = 0.15
+# Test fraction is the remaining complete runs (~0.15).
+altitude_m_range = [400000.0, 650000.0]
+inclination_deg_range = [30.0, 98.0]
+epoch_utc = "2026-01-01T00:00:00+00:00"
+epoch_span_days = 365.0
+training_magnetic_field_model = "dipole"
+initial_attitude_error_max_deg = 35.0
+body_rate_max_rad_s = 0.02
+training_inertia_kg_m2 = [0.001667, 0.001667, 0.001667]
+gyro_bias_training_std_rad_s = 3.0e-4
+
+[scenarios.reaction_wheel_fair_ml_campaign.models.dataset.masking]
+probability = 0.55
+max_outage_samples = 80
+
+[scenarios.reaction_wheel_fair_ml_campaign.models.dataset.degradations]
+# These fault realizations are created once in the shared dataset and therefore
+# are identical for MLP/CNN/GRU comparisons.
+enable_nonmissing_faults = true
+gyro_degradation_probability = 0.50
+gyro_bias_max_rad_s = 0.006
+gyro_drift_max_rad_s2 = 3.0e-5
+gyro_extra_noise_max_rad_s = 0.002
+sun_degradation_probability = 0.35
+sun_extra_noise_max = 0.03
+mag_degradation_probability = 0.50
+mag_extra_noise_max = 0.04
+mag_misalignment_max_deg = 20.0
+
+[scenarios.reaction_wheel_fair_ml_campaign.models.training]
+epochs = 18
+batch_size = 256
+learning_rate = 0.001
+weight_decay = 0.0
+early_stopping_patience = 5
+weight_seed = 98101
+loader_seed = 98201
+
+[scenarios.reaction_wheel_fair_ml_campaign.models.hyperparameters.mlp]
+hidden = [128, 64]
+dropout = 0.05
+
+[scenarios.reaction_wheel_fair_ml_campaign.models.hyperparameters.cnn]
+channels = [32, 48]
+kernel_size = 3
+
+[scenarios.reaction_wheel_fair_ml_campaign.models.hyperparameters.gru]
+hidden = 48
+layers = 1
+
+# --------------------------------------------------------------------------
+# Fault campaign generation. Set groups to any subset of ["A","B","C","D"].
+# The generated cases are applied unchanged to Healthy/Faulty/FDIR and all
+# 9 ML architecture x variant branches.
+# --------------------------------------------------------------------------
+[scenarios.reaction_wheel_fair_ml_campaign.fault_scenarios]
+enabled = true
+groups = ["D"]
+start_s = 800.0
+end_s = 2800.0
+
+# A — single sensor loss
+single_sensor_loss = ["sun", "gyro", "mag"]
+
+# B — intermittent faults
+dropout_sensors = ["gyro", "sun", "mag"]
+dropout_probabilities = [0.10, 0.25, 0.50, 0.75]
+
+# C — bias / drift / misalignment
+gyro_fault_axis = [1.0, -0.7, 0.5]
+gyro_bias_levels_rad_s = [0.001, 0.003, 0.006, 0.012]
+gyro_drift_axis = [1.0, -0.75, 0.5]
+gyro_drift_levels_rad_s2 = [1.0e-6, 3.0e-6, 8.0e-6]
+mag_misalignment_levels_deg = [5.0, 10.0, 20.0, 30.0]
+
+# D — multi-sensor / combined faults
+# These cases keep the same AOCS, MEKF, dataset and 27 trained recovery models.
+# Oracle FDIR is still used only to identify which sensor(s) are faulty; the ML
+# models remain responsible primarily for reconstructing healthy sensor data.
+combined_cases = [
+  "gyro_loss_sun_loss",
+  "gyro_loss_mag_loss",
+  "sun_loss_mag_loss",
+  "gyro_bias_mag_misalignment",
+  "gyro_drift_sun_dropout",
+  "gyro_dropout_mag_dropout",
+  "sun_dropout_mag_dropout",
+  "gyro_dropout_sun_dropout",
+  "all_three_degraded",
+  "all_three_loss",
+]
+
+# Shared severity settings used by the generated D cases.
+combined_dropout_probability = 0.50
+combined_gyro_bias_rad_s = 0.006
+combined_gyro_bias_axis = [1.0, -0.7, 0.5]
+combined_gyro_drift_rad_s2 = 3.0e-6
+combined_gyro_drift_axis = [1.0, -0.75, 0.5]
+combined_mag_misalignment_deg = 20.0
+
+
+# You may disable automatic generation and provide explicit cases instead:
+# [[scenarios.reaction_wheel_fair_ml_campaign.cases]]
+# enabled = true
+# name = "custom_case"
+# start_s = 800.0
+# end_s = 2800.0
+# sun = { type = "none" }
+# gyro = { type = "bias_step", bias_rad_s = [0.003, -0.0021, 0.0015] }
+# mag = { type = "none" }
+
+# --------------------------------------------------------------------------
+# CLASSICAL CONFIDENCE-BASED FDIR v2
+# Applied only to FDIR-only and ML-recovery branches. Healthy and Faulty MEKF
+# remain untouched baselines. Set mode = "oracle" to reproduce the previous
+# upper-bound experiments where injected fault labels are known perfectly.
+# --------------------------------------------------------------------------
+[scenarios.reaction_wheel_fair_ml_campaign.fdir]
+mode = "classical_v2"              # "classical_v2" or "oracle"; "classical" kept as alias
+arming_time_s = 120.0               # allow initial acquisition / MEKF convergence
+
+# Confidence/state logic
+confidence_smoothing_alpha = 0.50
+degraded_confidence_threshold = 0.65
+faulty_confidence_threshold = 0.45
+healthy_recovery_confidence_threshold = 0.80
+trusted_reference_update_confidence = 0.95
+fault_persistence_samples = 3
+recovery_persistence_samples = 20
+
+# A virtual sensor is requested only below this confidence / FAULTY or LOST.
+# DEGRADED real measurements are preferably retained with reduced trust.
+reconstruction_confidence_threshold = 0.45
+reject_confidence_threshold = 0.10
+minimum_vector_confidence_for_update = 0.05
+covariance_confidence_floor = 0.05
+
+# Gyroscope checks
+gyro_rate_residual_warn_rad_s = 0.0025
+gyro_rate_residual_fault_rad_s = 0.010
+gyro_absolute_limit_rad_s = 0.35
+gyro_cross_sensor_warn_deg = 1.5
+gyro_cross_sensor_fault_deg = 8.0
+gyro_track_reanchor_samples = 200   # 20 s at dt=0.1 s
+
+# Hard availability / packet validity. In the simulator gyro loss/dropout is
+# encoded by an exact zero fallback vector; real hardware should replace this
+# rule with the sensor interface validity/status bit if available.
+gyro_zero_is_unavailable = true
+gyro_zero_sample_threshold_rad_s = 1.0e-10
+gyro_stuck_delta_threshold_rad_s = 1.0e-10
+gyro_stuck_samples = 5
+gyro_cross_min_observable_rate_rad_s = 2.0e-4
+availability_recovery_grace_samples = 50  # minimum grace after a hard outage
+gyro_reacquisition_consistency_samples = 20
+vector_rate_window_samples = 10      # TRIAD rate reference over 1 s at dt=0.1 s
+vector_rate_limit_rad_s = 0.20
+
+# Sun / magnetometer model-innovation checks
+sun_innovation_warn_deg = 2.0
+sun_innovation_fault_deg = 12.0
+mag_innovation_warn_deg = 3.0
+mag_innovation_fault_deg = 15.0
+
+# Temporal/range checks
+vector_temporal_margin_deg = 0.8
+vector_temporal_fault_deg = 8.0
+vector_norm_warn = 0.08
+vector_norm_fault = 0.35
+vector_geometry_warn_deg = 2.0
+vector_geometry_fault_deg = 10.0
+vector_isolation_margin_deg = 3.0
+single_vector_innovation_quality_floor = 0.80
+geometry_consistent_innovation_quality_floor = 0.90
+ambiguous_geometry_quality_floor = 0.45
+
+# Vector stuck checks remain diagnostic-only in v2 because a body-frame vector
+# can legitimately remain nearly constant during fine pointing.
+vector_stuck_delta_threshold_deg = 1.0e-7
+vector_stuck_samples = 8
+vector_stuck_motion_min_deg = 0.05
+
+# Relative contribution to confidence score. These are normalized internally.
+weight_range = 0.20
+weight_innovation = 0.35
+weight_temporal = 0.20
+weight_cross_sensor = 0.25

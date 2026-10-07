@@ -27,6 +27,7 @@ from src.simulation.magnetorquer import (
 )
 from src.simulation.disturbances import gravity_gradient_torque_body
 from src.estimation.mekf import MEKF
+from src.fdir.classical_confidence import ClassicalConfidenceFDIR, HEALTHY, DEGRADED, FAULTY, LOST, EXPECTED_UNAVAILABLE
 from src.ml.virtual_sensor import train_virtual_sun_model
 from src.visualization.publication import PALETTE, create_subplots, finalize_figure, add_fault_span
 from src.visualization.animation import create_orbit_attitude_animation
@@ -67,53 +68,80 @@ def _rotation_matrix_xyz_deg(angles_deg):
 def _apply_extra_sensor_faults(gyro_meas, mag_meas, t_s, fault_case, active, rng):
     """Apply configurable gyro and magnetometer faults to one sensor sample.
 
-    ``fault_case`` is a plain dictionary.  Supported gyro fault types are
-    ``none``, ``bias_step``, ``drift``, ``noise``, ``scale``, ``stuck`` and ``loss``.
-    Supported magnetometer fault types are ``none``, ``bias``, ``noise``, ``scale``,
-    ``misalignment``, ``stuck``, ``dropout`` and ``loss``.
+    Supported gyro faults: none, bias_step, drift, noise, scale, stuck,
+    dropout, loss. Supported magnetometer faults: none, bias, noise, scale,
+    misalignment, stuck, dropout, loss. For dropout, the returned fault flag is
+    true only on samples that actually dropped; this is important for fair
+    intermittent-fault experiments.
     """
     g=np.asarray(gyro_meas,float).copy(); m=np.asarray(mag_meas,float).copy()
     if not active or not fault_case:
         return g,m,False,False
     gf=fault_case.get('gyro',{}) or {}; mf=fault_case.get('mag',{}) or {}
     gtype=str(gf.get('type','none')).lower(); mtype=str(mf.get('type','none')).lower()
-    g_fault=gtype!='none'; m_fault=mtype!='none'
+    g_fault=False; m_fault=False
     if gtype=='bias_step':
-        g += np.asarray(gf.get('bias_rad_s',[0.003,-0.002,0.0015]),float)
+        g += np.asarray(gf.get('bias_rad_s',[0.003,-0.002,0.0015]),float); g_fault=True
     elif gtype=='drift':
         elapsed=max(0.0,float(t_s)-float(fault_case.get('start_s',0.0)))
-        g += np.asarray(gf.get('drift_rad_s2',[2e-6,-1.5e-6,1e-6]),float)*elapsed
+        g += np.asarray(gf.get('drift_rad_s2',[2e-6,-1.5e-6,1e-6]),float)*elapsed; g_fault=True
     elif gtype=='noise':
-        g += rng.normal(0,float(gf.get('noise_std_rad_s',0.002)),3)
+        g += rng.normal(0,float(gf.get('noise_std_rad_s',0.002)),3); g_fault=True
     elif gtype=='scale':
-        g *= np.asarray(gf.get('scale',[1.15,0.85,1.10]),float)
+        g *= np.asarray(gf.get('scale',[1.15,0.85,1.10]),float); g_fault=True
     elif gtype=='stuck':
-        g[:] = np.asarray(gf.get('value_rad_s',[0.02,-0.015,0.01]),float)
+        g[:] = np.asarray(gf.get('value_rad_s',[0.02,-0.015,0.01]),float); g_fault=True
+    elif gtype=='dropout':
+        if rng.random() < float(gf.get('probability',0.5)):
+            g[:] = np.asarray(gf.get('fallback_rad_s',[0.0,0.0,0.0]),float); g_fault=True
     elif gtype=='loss':
-        # Treat a lost gyro as a held last/zero-like invalid measurement only when the
-        # estimator cannot consume NaNs. Here a configured fallback can emulate the
-        # flight software's fail-safe substituted rate.
-        g[:] = np.asarray(gf.get('fallback_rad_s',[0.0,0.0,0.0]),float)
+        g[:] = np.asarray(gf.get('fallback_rad_s',[0.0,0.0,0.0]),float); g_fault=True
     elif gtype!='none':
         raise ValueError(f'Unsupported gyro fault type: {gtype}')
 
     if mtype=='bias':
-        m = _unit(m + np.asarray(mf.get('bias_body',[0.05,-0.03,0.04]),float))
+        m = _unit(m + np.asarray(mf.get('bias_body',[0.05,-0.03,0.04]),float)); m_fault=True
     elif mtype=='noise':
-        m = _unit(m + rng.normal(0,float(mf.get('noise_std',0.03)),3))
+        m = _unit(m + rng.normal(0,float(mf.get('noise_std',0.03)),3)); m_fault=True
     elif mtype=='scale':
-        scale=np.asarray(mf.get('scale',[1.10,0.90,1.05]),float); m=_unit(m*scale)
+        scale=np.asarray(mf.get('scale',[1.10,0.90,1.05]),float); m=_unit(m*scale); m_fault=True
     elif mtype=='misalignment':
-        m=_unit(_rotation_matrix_xyz_deg(mf.get('angles_deg',[3.0,-2.0,4.0]))@m)
+        m=_unit(_rotation_matrix_xyz_deg(mf.get('angles_deg',[3.0,-2.0,4.0]))@m); m_fault=True
     elif mtype=='stuck':
-        m=_unit(np.asarray(mf.get('body_vector',[1.0,0.0,0.0]),float))
+        m=_unit(np.asarray(mf.get('body_vector',[1.0,0.0,0.0]),float)); m_fault=True
     elif mtype=='dropout':
-        if rng.random() < float(mf.get('probability',0.5)): m[:] = np.nan
+        if rng.random() < float(mf.get('probability',0.5)):
+            m[:] = np.nan; m_fault=True
     elif mtype=='loss':
-        m[:] = np.nan
+        m[:] = np.nan; m_fault=True
     elif mtype!='none':
         raise ValueError(f'Unsupported magnetometer fault type: {mtype}')
     return g,m,g_fault,m_fault
+
+
+def _triad_dcm_body_to_inertial(sun_body, mag_body, sun_i, mag_i):
+    """Estimate body-to-inertial DCM from two non-collinear vector observations."""
+    b1=_unit(sun_body); b2=_unit(mag_body); r1=_unit(sun_i); r2=_unit(mag_i)
+    cb=np.cross(b1,b2); cr=np.cross(r1,r2)
+    if np.linalg.norm(cb)<1e-5 or np.linalg.norm(cr)<1e-5:
+        return None
+    tb2=_unit(cb); tb3=_unit(np.cross(b1,tb2))
+    tr2=_unit(cr); tr3=_unit(np.cross(r1,tr2))
+    B=np.column_stack((b1,tb2,tb3)); R=np.column_stack((r1,tr2,tr3))
+    return R@B.T
+
+def _rate_from_dcm_pair(C0,C1,dt):
+    """Average body rate from two body-to-inertial DCMs using SO(3) log map."""
+    if C0 is None or C1 is None or dt<=0: return None
+    D=np.asarray(C0,float).T@np.asarray(C1,float)
+    c=float(np.clip((np.trace(D)-1.0)/2.0,-1.0,1.0)); th=float(np.arccos(c))
+    v=np.array([D[2,1]-D[1,2],D[0,2]-D[2,0],D[1,0]-D[0,1]],float)
+    if th<1e-8: rot=0.5*v
+    else:
+        st=np.sin(th)
+        if abs(st)<1e-8: return None
+        rot=(th/(2.0*st))*v
+    return rot/float(dt)
 
 def _make_environment(t, cfg, global_cfg):
     illum = cfg.get('illumination', {})
@@ -183,7 +211,8 @@ def _one_step_real(dt, state, inertia_diag, tau_rw_body, dipole_actual_am2, B_i_
 
 
 def _run_branch(branch, cfg, global_cfg, t, q0, omega0, sun_series, B_i_series,
-                orbit_states, eclipse_state, noise, predictor=None, fault_case=None):
+                orbit_states, eclipse_state, noise, predictor=None, fault_case=None, fdir_only=False,
+                fdir_mode='oracle', fdir_config=None):
     sc = global_cfg['sensors']
     dt = float(t[1] - t[0])
     n = len(t)
@@ -260,7 +289,43 @@ def _run_branch(branch, cfg, global_cfg, t, q0, omega0, sun_series, B_i_series,
     tau_mtq = np.zeros((n, 3)); tau_gg = np.zeros((n, 3)); bdot = np.zeros((n, 3))
     wheel_h = np.zeros((n, 3)); wheel_speed_rpm = np.zeros((n, 3)); dump_active = np.zeros(n, bool)
     ml_used = np.zeros(n, bool); ml_candidate = np.zeros(n, bool); ml_rejected = np.zeros(n, bool); sensor_faulted = np.zeros(n, bool)
+    ml_sun_used=np.zeros(n,bool); ml_gyro_used=np.zeros(n,bool); ml_mag_used=np.zeros(n,bool)
+    ml_sun_rejected=np.zeros(n,bool); ml_gyro_rejected=np.zeros(n,bool); ml_mag_rejected=np.zeros(n,bool)
+    ml_sun_gate_value=np.full(n,np.nan); ml_gyro_gate_value=np.full(n,np.nan); ml_mag_gate_value=np.full(n,np.nan)
+    ml_gyro_cross_sensor_gate_deg=np.full(n,np.nan)
     gyro_faulted=np.zeros(n,bool); mag_faulted=np.zeros(n,bool)
+
+    # FDIR diagnostics. The automatic classical detector is intentionally separate
+    # from the injected-fault truth flags used to score its detection performance.
+    fdir_mode=str(fdir_mode or 'oracle').lower()
+    fdir_cfg=dict(fdir_config or {})
+    classical_fdir=ClassicalConfidenceFDIR(fdir_cfg,dt=dt) if fdir_mode in ('classical','classical_v2') else None
+    fdir_conf_gyro=np.ones(n,float); fdir_conf_sun=np.ones(n,float); fdir_conf_mag=np.ones(n,float)
+    fdir_state_gyro=np.full(n,HEALTHY,dtype=object); fdir_state_sun=np.full(n,HEALTHY,dtype=object); fdir_state_mag=np.full(n,HEALTHY,dtype=object)
+    fdir_flag_gyro=np.zeros(n,bool); fdir_flag_sun=np.zeros(n,bool); fdir_flag_mag=np.zeros(n,bool)
+    fdir_detected_gyro=np.zeros(n,bool); fdir_detected_sun=np.zeros(n,bool); fdir_detected_mag=np.zeros(n,bool)
+    fdir_gyro_rate_residual=np.full(n,np.nan); fdir_gyro_vector_rate_residual=np.full(n,np.nan); fdir_gyro_cross_sensor=np.full(n,np.nan)
+    fdir_sun_innovation=np.full(n,np.nan); fdir_mag_innovation=np.full(n,np.nan)
+    fdir_geometry_error=np.full(n,np.nan); fdir_sun_track_error=np.full(n,np.nan); fdir_mag_track_error=np.full(n,np.nan)
+    fdir_hard_gyro=np.zeros(n,bool); fdir_hard_sun=np.zeros(n,bool); fdir_hard_mag=np.zeros(n,bool); fdir_sun_expected_unavailable=np.zeros(n,bool)
+    fdir_reconstruct_threshold=float(fdir_cfg.get('reconstruction_confidence_threshold',0.25))
+    fdir_reject_threshold=float(fdir_cfg.get('reject_confidence_threshold',0.10))
+    fdir_vector_min_conf=float(fdir_cfg.get('minimum_vector_confidence_for_update',0.05))
+    fdir_conf_floor=float(fdir_cfg.get('covariance_confidence_floor',0.05))
+    fdir_arming_time_s=float(fdir_cfg.get('arming_time_s',120.0))
+    fdir_armed=np.zeros(n,bool)
+
+    gate_cfg=cfg.get('ml_recovery_gate',{})
+    sun_gate_deg=float(gate_cfg.get('sun_max_disagreement_deg',12.0))
+    mag_gate_deg=float(gate_cfg.get('mag_max_disagreement_deg',15.0))
+    gyro_gate_rad_s=float(gate_cfg.get('gyro_max_disagreement_rad_s',0.025))
+    gyro_cross_gate_deg=float(gate_cfg.get('gyro_cross_sensor_max_disagreement_deg',8.0))
+    gyro_cross_min_refs=int(gate_cfg.get('gyro_cross_sensor_min_references',1))
+    gate_enabled=bool(gate_cfg.get('enabled',True))
+    gyro_fallback_tau_s=float(gate_cfg.get('gyro_fallback_decay_tau_s',20.0))
+    gyro_vector_rate_window_s=float(gate_cfg.get('gyro_vector_rate_window_s',1.0))
+    gyro_vector_rate_blend=float(gate_cfg.get('gyro_vector_rate_blend',0.5))
+    gyro_vector_rate_limit=float(gate_cfg.get('gyro_vector_rate_limit_rad_s',0.05))
     mode = np.empty(n, dtype=object); mode_code = np.zeros(n, int); control_on = np.zeros(n, bool); rate_damping_on = np.zeros(n, bool)
 
     truth[0, :4] = q0; truth[0, 4:] = omega0; qhat[0] = filt.q; bhat[0] = filt.b
@@ -276,6 +341,9 @@ def _run_branch(branch, cfg, global_cfg, t, q0, omega0, sun_series, B_i_series,
     frng = np.random.default_rng(int(cfg.get('fault_seed', 4501)))
     previous_mode = mode[0]
     is_dumping = False
+    last_good_rate=np.asarray(gyro[0]-bhat[0],float).copy()
+    triad_anchor_C=_triad_dcm_body_to_inertial(sun_raw[0],mag[0],sun_series[0],_unit(B_i_series[0])) if np.all(np.isfinite(sun_raw[0])) and np.all(np.isfinite(mag[0])) else None
+    triad_anchor_t=float(t[0])
 
     for k in range(1, n):
         sun_i = sun_series[k-1]; B_i = B_i_series[k-1]
@@ -353,30 +421,235 @@ def _run_branch(branch, cfg, global_cfg, t, q0, omega0, sun_series, B_i_series,
         fault_active = (t[k] >= fs and t[k] <= fe)
         if branch != 'healthy_mekf':
             gyro[k],mag[k],gyro_faulted[k],mag_faulted[k]=_apply_extra_sensor_faults(gyro[k],mag[k],t[k],fc,fault_active,frng)
+        # Maintain the fallback independently of injected truth in automatic FDIR v2.
+        # Oracle/legacy branches may still use the known fault flag for controlled
+        # upper-bound experiments; automatic FDIR updates this reference only after
+        # the detector has assessed the current sample below.
+        automatic_fdir = fdir_mode in ('classical','classical_v2') and branch not in ('healthy_mekf','faulty_mekf')
+        if not automatic_fdir:
+            if not gyro_faulted[k] and np.all(np.isfinite(gyro[k])):
+                last_good_rate=np.asarray(gyro[k]-bhat[k-1],float).copy()
+            elif gyro_fallback_tau_s>0:
+                last_good_rate*=np.exp(-dt/gyro_fallback_tau_s)
         measured = sun_raw[k].copy()
         if branch != 'healthy_mekf' and ft != 'none':
-            measured, faulted = _apply_sun_fault(measured, ft, sev, fault_active, frng)
+            measured, faulted = _apply_sun_fault(measured, ft, sev, fault_active, frng, probability=sun_cfg.get('probability'))
             sensor_faulted[k] = faulted or (fault_active and ft == 'sun_noise')
 
         physical_sun_visible = not (eclipse_as_loss and eclipse_state[k] == 2)
-        needs_recovery = physical_sun_visible and (not np.all(np.isfinite(measured)) or (branch == 'ml_recovery' and fault_active and ft == 'sun_noise'))
-        if branch == 'ml_recovery' and needs_recovery:
-            omega_virtual = gyro[k-1] - bhat[k-1]
-            candidate = predictor.predict(anchor, omega_virtual, mag[k], dt); ml_candidate[k] = True
-            qpred = quat_normalize(quat_multiply(qhat[k-1], small_angle_quat(omega_virtual * dt)))
-            predicted_sun = quat_to_dcm(qpred).T @ sun_series[k]
-            disagreement = np.degrees(np.arccos(np.clip(np.dot(_unit(candidate), _unit(predicted_sun)), -1, 1)))
-            if disagreement <= float(cfg.get('ml_gate_deg', 2.0)):
-                blend = float(cfg.get('ml_blend', 0.25)); measured = _unit((1-blend) * predicted_sun + blend * candidate)
-                ml_used[k] = True; anchor = measured.copy()
+        # During a gyro fault, two healthy vector sensors provide an independent
+        # coarse angular-rate estimate. TRIAD determines attitude at two instants;
+        # their SO(3) difference over a ~1 s window provides the fallback rate.
+        # This is intentionally a non-ML FDIR baseline.
+        sun_ok_for_rate=physical_sun_visible and (not bool(sensor_faulted[k])) and np.all(np.isfinite(measured))
+        mag_ok_for_rate=(not bool(mag_faulted[k])) and np.all(np.isfinite(mag[k]))
+        if (not automatic_fdir) and bool(gyro_faulted[k]) and sun_ok_for_rate and mag_ok_for_rate:
+            Ctriad=_triad_dcm_body_to_inertial(measured,mag[k],sun_series[k],_unit(B_i_series[k]))
+            if Ctriad is not None and (float(t[k])-triad_anchor_t)>=gyro_vector_rate_window_s:
+                wr=_rate_from_dcm_pair(triad_anchor_C,Ctriad,float(t[k])-triad_anchor_t)
+                if wr is not None and np.all(np.isfinite(wr)):
+                    wn=float(np.linalg.norm(wr))
+                    if wn>gyro_vector_rate_limit and wn>0: wr*=gyro_vector_rate_limit/wn
+                    a=float(np.clip(gyro_vector_rate_blend,0.0,1.0))
+                    last_good_rate=(1-a)*last_good_rate+a*wr
+                triad_anchor_C=Ctriad; triad_anchor_t=float(t[k])
+        elif (not automatic_fdir) and (not bool(gyro_faulted[k])) and sun_ok_for_rate and mag_ok_for_rate:
+            Ctriad=_triad_dcm_body_to_inertial(measured,mag[k],sun_series[k],_unit(B_i_series[k]))
+            if Ctriad is not None: triad_anchor_C=Ctriad; triad_anchor_t=float(t[k])
+        # FDIR-only baseline: isolate a known bad sensor but do not synthesize a
+        # replacement. This quantifies the value of fault isolation independently
+        # from the value added by a virtual sensor.
+        sun_bad_oracle = bool(sensor_faulted[k]) and physical_sun_visible
+        gyro_bad_oracle = bool(gyro_faulted[k])
+        mag_bad_oracle = bool(mag_faulted[k])
+
+        # Automatic FDIR uses only measurements, the previous estimator state and
+        # known inertial references. Injected-fault truth is used only for later
+        # scoring and is never passed into the detector.
+        if classical_fdir is not None and branch not in ('healthy_mekf','faulty_mekf') and float(t[k])>=fdir_arming_time_s:
+            fdir_armed[k]=True
+            fd=classical_fdir.update(gyro[k],measured,mag[k],qhat[k-1],bhat[k-1],sun_series[k],B_i_series[k],sun_visible=physical_sun_visible)
+            fdir_conf_gyro[k]=fd.confidence['gyro']; fdir_conf_sun[k]=fd.confidence['sun']; fdir_conf_mag[k]=fd.confidence['mag']
+            fdir_state_gyro[k]=fd.state['gyro']; fdir_state_sun[k]=fd.state['sun']; fdir_state_mag[k]=fd.state['mag']
+            fdir_detected_gyro[k]=fd.state['gyro'] not in (HEALTHY, EXPECTED_UNAVAILABLE)
+            fdir_detected_sun[k]=physical_sun_visible and fd.state['sun'] not in (HEALTHY, EXPECTED_UNAVAILABLE)
+            fdir_detected_mag[k]=fd.state['mag'] not in (HEALTHY, EXPECTED_UNAVAILABLE)
+            # Reconstruction trigger is intentionally stricter than detection: a
+            # DEGRADED measurement can remain useful after covariance inflation.
+            fdir_flag_gyro[k]=fd.is_bad('gyro',fdir_reconstruct_threshold)
+            fdir_flag_sun[k]=physical_sun_visible and fd.is_bad('sun',fdir_reconstruct_threshold)
+            fdir_flag_mag[k]=fd.is_bad('mag',fdir_reconstruct_threshold)
+            fdir_gyro_rate_residual[k]=fd.diagnostics.get('gyro_rate_residual_rad_s',np.nan)
+            fdir_gyro_vector_rate_residual[k]=fd.diagnostics.get('gyro_vector_rate_residual_rad_s',np.nan)
+            fdir_gyro_cross_sensor[k]=fd.diagnostics.get('gyro_cross_sensor_deg',np.nan)
+            fdir_sun_innovation[k]=fd.diagnostics.get('sun_innovation_deg',np.nan)
+            fdir_mag_innovation[k]=fd.diagnostics.get('mag_innovation_deg',np.nan)
+            fdir_geometry_error[k]=fd.diagnostics.get('sun_mag_geometry_error_deg',np.nan)
+            fdir_sun_track_error[k]=fd.diagnostics.get('sun_gyro_track_error_deg',np.nan)
+            fdir_mag_track_error[k]=fd.diagnostics.get('mag_gyro_track_error_deg',np.nan)
+            fdir_hard_gyro[k]=bool(fd.hard_unavailable.get('gyro',False)); fdir_hard_sun[k]=bool(fd.hard_unavailable.get('sun',False)); fdir_hard_mag[k]=bool(fd.hard_unavailable.get('mag',False))
+            fdir_sun_expected_unavailable[k]=bool(fd.expected_unavailable.get('sun',False))
+            gyro_bad_detected=bool(fdir_flag_gyro[k]); sun_bad_detected=bool(fdir_flag_sun[k]); mag_bad_detected=bool(fdir_flag_mag[k])
+
+            # Automatic FDIR v2 fallback update. No injected-fault labels are used.
+            if np.all(np.isfinite(gyro[k])) and not fdir_hard_gyro[k] and fdir_conf_gyro[k] >= float(fdir_cfg.get('trusted_reference_update_confidence',0.95)) and fdir_state_gyro[k] == HEALTHY:
+                last_good_rate=np.asarray(gyro[k]-bhat[k-1],float).copy()
+            elif gyro_fallback_tau_s>0:
+                last_good_rate*=np.exp(-dt/gyro_fallback_tau_s)
+
+            # When gyro is unavailable/untrusted, two sufficiently trusted absolute
+            # vectors provide an independent non-ML TRIAD rate fallback.
+            sun_ok_auto=physical_sun_visible and np.all(np.isfinite(measured)) and fdir_conf_sun[k] >= fdir_vector_min_conf and not fdir_hard_sun[k]
+            mag_ok_auto=np.all(np.isfinite(mag[k])) and fdir_conf_mag[k] >= fdir_vector_min_conf and not fdir_hard_mag[k]
+            if gyro_bad_detected and sun_ok_auto and mag_ok_auto:
+                Ctriad=_triad_dcm_body_to_inertial(measured,mag[k],sun_series[k],_unit(B_i_series[k]))
+                if Ctriad is not None and (float(t[k])-triad_anchor_t)>=gyro_vector_rate_window_s:
+                    wr=_rate_from_dcm_pair(triad_anchor_C,Ctriad,float(t[k])-triad_anchor_t)
+                    if wr is not None and np.all(np.isfinite(wr)):
+                        wn=float(np.linalg.norm(wr))
+                        if wn>gyro_vector_rate_limit and wn>0: wr*=gyro_vector_rate_limit/wn
+                        a=float(np.clip(gyro_vector_rate_blend,0.0,1.0)); last_good_rate=(1-a)*last_good_rate+a*wr
+                    triad_anchor_C=Ctriad; triad_anchor_t=float(t[k])
+            elif (not gyro_bad_detected) and sun_ok_auto and mag_ok_auto:
+                Ctriad=_triad_dcm_body_to_inertial(measured,mag[k],sun_series[k],_unit(B_i_series[k]))
+                if Ctriad is not None: triad_anchor_C=Ctriad; triad_anchor_t=float(t[k])
+        else:
+            if fdir_mode=='oracle' and branch not in ('healthy_mekf','faulty_mekf'):
+                # Oracle mode remains available as a controlled recovery upper-bound.
+                fdir_armed[k]=True
+                gyro_bad_detected=gyro_bad_oracle; sun_bad_detected=sun_bad_oracle; mag_bad_detected=mag_bad_oracle
+                fdir_conf_gyro[k]=0.0 if gyro_bad_detected else 1.0
+                fdir_conf_sun[k]=0.0 if sun_bad_detected else 1.0
+                fdir_conf_mag[k]=0.0 if mag_bad_detected else 1.0
+                fdir_state_gyro[k]=FAULTY if gyro_bad_detected else HEALTHY
+                fdir_state_sun[k]=FAULTY if sun_bad_detected else HEALTHY
+                fdir_state_mag[k]=FAULTY if mag_bad_detected else HEALTHY
+                fdir_flag_gyro[k]=gyro_bad_detected; fdir_flag_sun[k]=sun_bad_detected; fdir_flag_mag[k]=mag_bad_detected
+                fdir_detected_gyro[k]=gyro_bad_detected; fdir_detected_sun[k]=sun_bad_detected; fdir_detected_mag[k]=mag_bad_detected
             else:
-                measured = np.full(3, np.nan); ml_rejected[k] = True; anchor = _unit(candidate)
-        elif np.all(np.isfinite(measured)):
-            anchor = measured.copy()
+                # Healthy/Faulty baselines and the pre-arming interval do not use FDIR.
+                gyro_bad_detected=False; sun_bad_detected=False; mag_bad_detected=False
+                fdir_conf_gyro[k]=1.0; fdir_conf_sun[k]=1.0; fdir_conf_mag[k]=1.0
+                fdir_state_gyro[k]=HEALTHY; fdir_state_sun[k]=HEALTHY; fdir_state_mag[k]=HEALTHY
+
+        if fdir_only and branch != 'healthy_mekf':
+            # Confidence-based isolation: vector sensors are retained with inflated
+            # covariance while degraded and removed only at very low confidence.
+            # Gyro is a propagation input rather than an EKF measurement, therefore
+            # degraded gyro data are blended toward the last trusted rate; complete
+            # loss/fault falls back fully to the trusted-rate estimate.
+            if fdir_mode in ('classical','classical_v2'):
+                cg=float(np.clip(fdir_conf_gyro[k],0.0,1.0))
+                gyro_fb=np.asarray(last_good_rate,float)+np.asarray(bhat[k-1],float)
+                if not np.all(np.isfinite(gyro[k])) or cg<=fdir_reject_threshold:
+                    gyro[k]=gyro_fb
+                elif cg<1.0:
+                    gyro[k]=cg*np.asarray(gyro[k],float)+(1.0-cg)*gyro_fb
+                if fdir_conf_mag[k] <= fdir_vector_min_conf:
+                    mag[k]=np.full(3,np.nan)
+                if physical_sun_visible and fdir_conf_sun[k] <= fdir_vector_min_conf:
+                    measured=np.full(3,np.nan)
+            else:
+                if gyro_bad_detected:
+                    gyro[k]=np.asarray(last_good_rate,float)+np.asarray(bhat[k-1],float)
+                if mag_bad_detected:
+                    mag[k]=np.full(3,np.nan)
+                if sun_bad_detected:
+                    measured=np.full(3,np.nan)
+
+        multisensor_ml = predictor is not None and hasattr(predictor, 'predict_measurements')
+        if multisensor_ml and branch not in ('healthy_mekf','faulty_mekf','fdir_only'):
+            # Oracle FDIR for recovery-isolation experiments: the injected fault flags
+            # determine which measurement is replaced. Detection quality can then be
+            # studied separately without confounding reconstruction performance.
+            sun_bad = sun_bad_detected
+            gyro_bad = gyro_bad_detected
+            mag_bad = mag_bad_detected
+            virtual_gyro, virtual_sun, virtual_mag = predictor.predict_measurements(
+                gyro[k], measured, mag[k], faulty=(gyro_bad, sun_bad or not np.all(np.isfinite(measured)), mag_bad)
+            )
+            # Gated recovery: compare a virtual measurement with the measurement
+            # predicted by the current filter state and the remaining healthy
+            # references. A rejected virtual sensor falls back to propagation rather
+            # than injecting an inconsistent measurement into the MEKF.
+            Cgate=quat_to_dcm(qhat[k-1])
+            sun_ref_body=_unit(Cgate.T@sun_series[k])
+            mag_ref_body=_unit(Cgate.T@_unit(B_i_series[k]))
+            gyro_ref=np.asarray(last_good_rate,float)+np.asarray(bhat[k-1],float)
+            if gyro_bad:
+                # Sensor-specific gyro networks predict the bias-free body rate.
+                # Convert it to an MEKF-compatible synthetic measurement by adding
+                # the filter's current bias estimate only after gating.
+                virtual_rate=np.asarray(virtual_gyro,float)
+                virtual_gyro_meas=virtual_rate+np.asarray(bhat[k-1],float)
+                gd=float(np.linalg.norm(virtual_gyro_meas-gyro_ref)); ml_gyro_gate_value[k]=gd; ml_candidate[k]=True
+                # Cross-sensor consistency gate. Propagate the previous attitude by
+                # one sample using the candidate virtual gyro, then verify that the
+                # resulting attitude predicts the remaining HEALTHY vector sensors.
+                # This avoids validating a gyro candidate against the same rate
+                # estimate that may already have been corrupted by the gyro fault.
+                omega_candidate=virtual_rate
+                qpred=quat_normalize(quat_multiply(qhat[k-1],small_angle_quat(omega_candidate*dt)))
+                Cpred=quat_to_dcm(qpred)
+                cross_errors=[]
+                if (not sun_bad) and physical_sun_visible and np.all(np.isfinite(measured)):
+                    ps=_unit(Cpred.T@sun_series[k])
+                    cross_errors.append(float(np.degrees(np.arccos(np.clip(np.dot(ps,_unit(measured)),-1,1)))))
+                if (not mag_bad) and np.all(np.isfinite(mag[k])):
+                    pm=_unit(Cpred.T@_unit(B_i_series[k]))
+                    cross_errors.append(float(np.degrees(np.arccos(np.clip(np.dot(pm,_unit(mag[k])),-1,1)))))
+                cross_value=max(cross_errors) if cross_errors else np.inf
+                ml_gyro_cross_sensor_gate_deg[k]=cross_value if np.isfinite(cross_value) else np.nan
+                cross_ok=(len(cross_errors)>=gyro_cross_min_refs and np.isfinite(cross_value) and cross_value<=gyro_cross_gate_deg)
+                rate_ok=np.isfinite(gd) and gd<=gyro_gate_rad_s
+                if (not gate_enabled) or (rate_ok and cross_ok):
+                    gyro[k]=virtual_gyro_meas; ml_gyro_used[k]=True
+                else:
+                    gyro[k]=gyro_ref; ml_gyro_rejected[k]=True
+            if mag_bad:
+                md=float(np.degrees(np.arccos(np.clip(np.dot(_unit(virtual_mag),mag_ref_body),-1,1)))); ml_mag_gate_value[k]=md; ml_candidate[k]=True
+                if (not gate_enabled) or (np.isfinite(md) and md<=mag_gate_deg):
+                    mag[k]=virtual_mag; ml_mag_used[k]=True
+                else:
+                    mag[k]=np.full(3,np.nan); ml_mag_rejected[k]=True
+            # A physical eclipse is not a Sun-sensor fault. Never synthesize a Sun
+            # measurement in full umbra.
+            if sun_bad:
+                sd=float(np.degrees(np.arccos(np.clip(np.dot(_unit(virtual_sun),sun_ref_body),-1,1)))); ml_sun_gate_value[k]=sd; ml_candidate[k]=True
+                if (not gate_enabled) or (np.isfinite(sd) and sd<=sun_gate_deg):
+                    measured=virtual_sun; ml_sun_used[k]=True; anchor=measured.copy()
+                else:
+                    measured=np.full(3,np.nan); ml_sun_rejected[k]=True
+            ml_used[k]=bool(ml_sun_used[k] or ml_gyro_used[k] or ml_mag_used[k])
+            ml_rejected[k]=bool(ml_sun_rejected[k] or ml_gyro_rejected[k] or ml_mag_rejected[k])
+        else:
+            needs_recovery = physical_sun_visible and (not np.all(np.isfinite(measured)) or (branch == 'ml_recovery' and fault_active and ft == 'sun_noise'))
+            if branch == 'ml_recovery' and needs_recovery:
+                omega_virtual = gyro[k-1] - bhat[k-1]
+                candidate = predictor.predict(anchor, omega_virtual, mag[k], dt); ml_candidate[k] = True
+                qpred = quat_normalize(quat_multiply(qhat[k-1], small_angle_quat(omega_virtual * dt)))
+                predicted_sun = quat_to_dcm(qpred).T @ sun_series[k]
+                disagreement = np.degrees(np.arccos(np.clip(np.dot(_unit(candidate), _unit(predicted_sun)),-1,1)))
+                if disagreement <= float(cfg.get('ml_gate_deg', 2.0)):
+                    blend = float(cfg.get('ml_blend', 0.25)); measured = _unit((1-blend) * predicted_sun + blend * candidate)
+                    ml_used[k] = True; ml_sun_used[k]=True; anchor = measured.copy()
+                else:
+                    measured = np.full(3,np.nan); ml_rejected[k] = True; anchor = _unit(candidate)
+            elif np.all(np.isfinite(measured)):
+                anchor = measured.copy()
         sun_used[k] = measured
 
-        sun_std = float(cfg.get('ml_virtual_sensor_noise_std', 0.01)) if ml_used[k] else None
-        q, b, _ = filt.step(gyro[k-1], sun_used[k], mag[k], sun_series[k], _unit(B_i_series[k]), dt, sun_noise_std=sun_std)
+        sun_std = float(cfg.get('ml_virtual_sensor_noise_std', 0.01)) if ml_sun_used[k] else None
+        mag_std = float(cfg.get('ml_virtual_sensor_noise_std', 0.01)) if ml_mag_used[k] else None
+        # In classical FDIR mode, a degraded real vector sensor is not immediately
+        # discarded. Its measurement covariance is inflated as confidence falls.
+        if classical_fdir is not None and branch not in ('healthy_mekf','faulty_mekf'):
+            base_vstd=float(sc['vector_noise_std'])
+            if sun_std is None and np.all(np.isfinite(sun_used[k])):
+                sun_std=base_vstd/np.sqrt(max(float(fdir_conf_sun[k]),fdir_conf_floor))
+            if mag_std is None and np.all(np.isfinite(mag[k])):
+                mag_std=base_vstd/np.sqrt(max(float(fdir_conf_mag[k]),fdir_conf_floor))
+        q, b, _ = filt.step(gyro[k-1], sun_used[k], mag[k], sun_series[k], _unit(B_i_series[k]), dt, sun_noise_std=sun_std, mag_noise_std=mag_std)
         qhat[k] = q; bhat[k] = b
         est_point = sun_pointing_error_deg(qhat[k], axis, sun_series[k])
         real_sun_available = bool(np.all(np.isfinite(measured))) and not bool(ml_used[k])
@@ -401,6 +674,18 @@ def _run_branch(branch, cfg, global_cfg, t, q0, omega0, sun_series, B_i_series,
         rw_tau=rw_tau, mtq_dump_cmd=mtq_dump_cmd, mtq_dump_actual=mtq_dump_actual, tau_mtq=tau_mtq, tau_gg=tau_gg,
         bdot=bdot, wheel_h=wheel_h, wheel_speed_rpm=wheel_speed_rpm, dump_active=dump_active,
         ml_used=ml_used, ml_candidate=ml_candidate, ml_rejected=ml_rejected, sensor_faulted=sensor_faulted, gyro_faulted=gyro_faulted, mag_faulted=mag_faulted,
+        ml_sun_used=ml_sun_used, ml_gyro_used=ml_gyro_used, ml_mag_used=ml_mag_used,
+        ml_sun_rejected=ml_sun_rejected, ml_gyro_rejected=ml_gyro_rejected, ml_mag_rejected=ml_mag_rejected,
+        ml_sun_gate_value=ml_sun_gate_value, ml_gyro_gate_value=ml_gyro_gate_value, ml_mag_gate_value=ml_mag_gate_value,
+        ml_gyro_cross_sensor_gate_deg=ml_gyro_cross_sensor_gate_deg,
+        fdir_mode=fdir_mode, fdir_armed=fdir_armed, fdir_conf_gyro=fdir_conf_gyro, fdir_conf_sun=fdir_conf_sun, fdir_conf_mag=fdir_conf_mag,
+        fdir_state_gyro=fdir_state_gyro, fdir_state_sun=fdir_state_sun, fdir_state_mag=fdir_state_mag,
+        fdir_detected_gyro=fdir_detected_gyro, fdir_detected_sun=fdir_detected_sun, fdir_detected_mag=fdir_detected_mag,
+        fdir_flag_gyro=fdir_flag_gyro, fdir_flag_sun=fdir_flag_sun, fdir_flag_mag=fdir_flag_mag,
+        fdir_gyro_rate_residual=fdir_gyro_rate_residual, fdir_gyro_vector_rate_residual=fdir_gyro_vector_rate_residual, fdir_gyro_cross_sensor=fdir_gyro_cross_sensor,
+        fdir_sun_innovation=fdir_sun_innovation, fdir_mag_innovation=fdir_mag_innovation,
+        fdir_geometry_error=fdir_geometry_error, fdir_sun_track_error=fdir_sun_track_error, fdir_mag_track_error=fdir_mag_track_error,
+        fdir_hard_gyro=fdir_hard_gyro, fdir_hard_sun=fdir_hard_sun, fdir_hard_mag=fdir_hard_mag, fdir_sun_expected_unavailable=fdir_sun_expected_unavailable,
         mode=mode, mode_code=mode_code, control_on=control_on, rate_damping_on=rate_damping_on,
         true_point=true_point, est_point=est_point, att_err=att_err, sun_rec_err=sun_rec_err, inertia=inertia,
     )
