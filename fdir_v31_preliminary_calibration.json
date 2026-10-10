@@ -1,0 +1,39 @@
+{
+  "status": "preliminary calibration used to correct FDIR v3 false accumulation; freeze/recalibrate on dedicated healthy calibration runs before final held-out thesis campaign",
+  "source_window": {
+    "branch": "fdir_only",
+    "fault_active": false,
+    "time_s": [
+      200.0,
+      700.0
+    ]
+  },
+  "healthy_diagnostics": {
+    "gyro_vector_rate_residual_rad_s": {
+      "p99_9": 0.0213775505620843,
+      "max": 0.0231009909421781
+    },
+    "gyro_cross_sensor_deg": {
+      "p99_9": 0.5248027259087054,
+      "max": 0.6029003014630798
+    },
+    "sun_mag_geometry_error_deg": {
+      "p99_9": 0.5070976955515789,
+      "max": 0.5445039859234839
+    }
+  },
+  "v31_defaults": {
+    "gyro_vector_rate_warn_rad_s": 0.024,
+    "gyro_vector_rate_fault_rad_s": 0.05,
+    "gyro_cross_sensor_warn_deg": 1.0,
+    "gyro_cross_sensor_fault_deg": 8.0,
+    "vector_geometry_warn_deg": 1.0,
+    "vector_geometry_fault_deg": 5.0,
+    "soft_ewma_alpha": 0.05,
+    "soft_cusum_gate": 0.15,
+    "soft_cusum_leak_tau_s": 60.0,
+    "soft_cusum_reset_tau_s": 3.0,
+    "soft_cusum_warn_score_s": 2.0,
+    "soft_cusum_fault_score_s": 8.0
+  }
+}

@@ -74,7 +74,7 @@ scenario_ids = [0, 3, 8, 9]
 # Select one end-to-end operational scenario. Future scenarios are added to the registry
 # and chosen here without changing the command used to launch the project.
 enabled = true
-active = "reaction_wheel_fair_ml_campaign"
+active = "reaction_wheel_ml_fdir_campaign"
 
 [scenarios.sun_pointing]
 duration_s = 600.0
@@ -945,6 +945,37 @@ body_rate_max_rad_s = 0.02
 training_inertia_kg_m2 = [0.001667, 0.001667, 0.001667]
 gyro_bias_training_std_rad_s = 3.0e-4
 
+
+# Mission-specific orbit-context training.
+# Sensor truth is generated on the actual orbit; orbital-context features are
+# generated from a separately perturbed known/planned orbit.
+[scenarios.reaction_wheel_fair_ml_campaign.models.dataset.mission_orbit]
+enabled = true
+nominal_altitude_m = 500000.0
+nominal_inclination_deg = 51.6
+nominal_raan_deg = 0.0
+nominal_phase_deg = 0.0
+randomize_phase_each_run = true
+
+# Launch/injection dispersion used to vary the physical training trajectory.
+actual_altitude_injection_half_range_m = 5000.0
+actual_inclination_injection_half_range_deg = 0.10
+actual_raan_injection_half_range_deg = 0.10
+actual_phase_injection_half_range_deg = 1.0
+
+# Conservative on-board orbit-knowledge envelope seen during training.
+knowledge_altitude_uncertainty_m = 1000.0
+knowledge_inclination_uncertainty_deg = 0.50
+knowledge_raan_uncertainty_deg = 0.25
+knowledge_phase_uncertainty_deg = 1.0
+
+# Main Group-D run can use a deterministic orbit-knowledge error. This changes
+# only the ML context, never the physical spacecraft trajectory.
+runtime_knowledge_altitude_error_m = 0.0
+runtime_knowledge_inclination_error_deg = 0.25
+runtime_knowledge_raan_error_deg = 0.0
+runtime_knowledge_phase_error_deg = 0.0
+
 [scenarios.reaction_wheel_fair_ml_campaign.models.dataset.masking]
 probability = 0.55
 max_outage_samples = 80
@@ -971,6 +1002,18 @@ weight_decay = 0.0
 early_stopping_patience = 5
 weight_seed = 98101
 loader_seed = 98201
+
+
+[scenarios.reaction_wheel_fair_ml_campaign.models.orbit_uncertainty_sweep]
+# Evaluates already-trained networks on the same synthetic trajectories while
+# changing only inclination-knowledge uncertainty. No retraining is performed.
+enabled = true
+inclination_uncertainty_deg = [0.0, 0.10, 0.25, 0.50, 1.00]
+runs = 8
+duration_s = 30.0
+seed = 97555
+split_seed = 97572
+batch_size = 1024
 
 [scenarios.reaction_wheel_fair_ml_campaign.models.hyperparameters.mlp]
 hidden = [128, 64]
@@ -1011,8 +1054,8 @@ mag_misalignment_levels_deg = [5.0, 10.0, 20.0, 30.0]
 
 # D — multi-sensor / combined faults
 # These cases keep the same AOCS, MEKF, dataset and 27 trained recovery models.
-# Oracle FDIR is still used only to identify which sensor(s) are faulty; the ML
-# models remain responsible primarily for reconstructing healthy sensor data.
+# Automatic FDIR v3 assesses sensor trust; the ML models remain responsible
+# primarily for reconstructing healthy sensor data when recovery is requested.
 combined_cases = [
   "gyro_loss_sun_loss",
   "gyro_loss_mag_loss",
@@ -1046,13 +1089,13 @@ combined_mag_misalignment_deg = 20.0
 # mag = { type = "none" }
 
 # --------------------------------------------------------------------------
-# CLASSICAL CONFIDENCE-BASED FDIR v2
-# Applied only to FDIR-only and ML-recovery branches. Healthy and Faulty MEKF
+# CLASSICAL CONFIDENCE-BASED FDIR v3
+# v3 keeps v2 hard-fault handling and adds persistent EWMA/CUSUM soft-fault evidence. Healthy and Faulty MEKF
 # remain untouched baselines. Set mode = "oracle" to reproduce the previous
 # upper-bound experiments where injected fault labels are known perfectly.
 # --------------------------------------------------------------------------
 [scenarios.reaction_wheel_fair_ml_campaign.fdir]
-mode = "classical_v2"              # "classical_v2" or "oracle"; "classical" kept as alias
+mode = "classical_v31"             # v3.1: leaky/gated persistent detector; oracle retained only as upper bound
 arming_time_s = 120.0               # allow initial acquisition / MEKF convergence
 
 # Confidence/state logic
@@ -1071,11 +1114,31 @@ reject_confidence_threshold = 0.10
 minimum_vector_confidence_for_update = 0.05
 covariance_confidence_floor = 0.05
 
+# Persistent soft-fault evidence (FDIR v3.1)
+# Evidence is sensor-specific. A leaky, time-scaled CUSUM runs only while the
+# EWMA anomaly score is above the gate, so healthy residuals cannot accumulate
+# indefinitely. Hard loss/eclipse/re-entry reset the statistic.
+soft_ewma_alpha = 0.05
+soft_cusum_gate = 0.15
+soft_cusum_leak_tau_s = 60.0
+soft_cusum_reset_tau_s = 3.0
+soft_cusum_warn_score_s = 2.0
+soft_cusum_fault_score_s = 8.0
+soft_accumulator_weight = 0.65
+
 # Gyroscope checks
-gyro_rate_residual_warn_rad_s = 0.0025
-gyro_rate_residual_fault_rad_s = 0.010
+# The independent TRIAD-derived rate threshold was calibrated conservatively
+# above the healthy pre-fault tail of the previous campaign.
+gyro_vector_rate_warn_rad_s = 0.024
+gyro_vector_rate_fault_rad_s = 0.050
+# Last-trusted-rate residual is only an instantaneous sanity check, not CUSUM input.
+gyro_reference_rate_warn_rad_s = 0.010
+gyro_reference_rate_fault_rad_s = 0.040
+# Legacy keys retained for compatibility with older code paths.
+gyro_rate_residual_warn_rad_s = 0.010
+gyro_rate_residual_fault_rad_s = 0.040
 gyro_absolute_limit_rad_s = 0.35
-gyro_cross_sensor_warn_deg = 1.5
+gyro_cross_sensor_warn_deg = 1.0
 gyro_cross_sensor_fault_deg = 8.0
 gyro_track_reanchor_samples = 200   # 20 s at dt=0.1 s
 
@@ -1103,14 +1166,14 @@ vector_temporal_margin_deg = 0.8
 vector_temporal_fault_deg = 8.0
 vector_norm_warn = 0.08
 vector_norm_fault = 0.35
-vector_geometry_warn_deg = 2.0
-vector_geometry_fault_deg = 10.0
+vector_geometry_warn_deg = 1.0
+vector_geometry_fault_deg = 5.0
 vector_isolation_margin_deg = 3.0
-single_vector_innovation_quality_floor = 0.80
-geometry_consistent_innovation_quality_floor = 0.90
-ambiguous_geometry_quality_floor = 0.45
+single_vector_innovation_quality_floor = 0.95
+geometry_consistent_innovation_quality_floor = 0.95
+ambiguous_geometry_quality_floor = 0.70
 
-# Vector stuck checks remain diagnostic-only in v2 because a body-frame vector
+# Vector stuck checks remain diagnostic-only because a body-frame vector
 # can legitimately remain nearly constant during fine pointing.
 vector_stuck_delta_threshold_deg = 1.0e-7
 vector_stuck_samples = 8
@@ -1121,3 +1184,150 @@ weight_range = 0.20
 weight_innovation = 0.35
 weight_temporal = 0.20
 weight_cross_sensor = 0.25
+
+
+# ============================================================================
+# EXPERIMENT 2 — ML-ASSISTED FDIR
+# ============================================================================
+# Experiment 1 (reaction_wheel_fair_ml_campaign) remains unchanged and tests
+# ML as a virtual sensor / direct recovery mechanism. Experiment 2 asks a
+# different question: can lightweight ML improve detection and isolation of
+# gradual/soft sensor faults, while deterministic logic remains responsible for
+# obvious hard failures such as loss/dropout/invalid packets?
+#
+# Main comparison:
+#   Classical FDIR v3.1
+#   Pure ML-FDIR: MLP / CNN / GRU
+#   Hybrid FDIR: classical hard-availability logic + ML soft-fault decision
+#
+# Primary metrics: precision, recall, F1, false-alarm rate, episode detection
+# probability and detection delay. Pointing/attitude are retained in the
+# timeseries only as secondary context; recovery remains Experiment 1.
+# ============================================================================
+[scenarios.reaction_wheel_ml_fdir_campaign]
+dt_s = 0.1
+orbit_profile = "global"
+magnetic_field_model = "igrf14"
+plots_enabled = true
+# The full evaluation timeseries is automatically ZIP-compressed because the CSV
+# can become large. Set true only when an uncompressed copy is also required.
+keep_uncompressed_timeseries = false
+
+[scenarios.reaction_wheel_ml_fdir_campaign.models]
+architectures = ["mlp", "cnn", "gru"]
+# 5 s causal window at dt=0.1 s. All architectures see the same samples/windows.
+window = 50
+# Online probability post-processing. Operational thresholds are selected on
+# COMPLETE validation sequences after this exact EWMA+persistence logic and are
+# then frozen for held-out evaluation.
+probability_ewma_alpha = 0.30
+persistence_samples = 3
+reset_samples = 2
+inference_batch_size = 1024
+# Pure-ML threshold: maximize F1 subject to validation FAR <= 1% per sensor.
+threshold_max_false_alarm_rate_pct = 1.0
+# Hybrid threshold: classical v3.1 is preserved; ML may increase validation FAR
+# by at most 1 percentage point while improving F1/recall.
+hybrid_max_incremental_far_pct = 1.0
+# Final heterogeneous Hybrid FDIR: select the best architecture independently
+# for gyro/Sun/magnetometer using VALIDATION data only. If no ML architecture
+# improves validation F1 by at least this margin, classical-only is retained.
+heterogeneous_hybrid_enabled = true
+heterogeneous_min_validation_f1_gain_pct = 0.25
+
+[scenarios.reaction_wheel_ml_fdir_campaign.models.training]
+epochs = 20
+batch_size = 256
+learning_rate = 0.001
+weight_decay = 0.0
+early_stopping_patience = 5
+weight_seed = 12101
+loader_seed = 12118
+max_pos_weight = 25.0
+inference_timing_repetitions = 300
+
+[scenarios.reaction_wheel_ml_fdir_campaign.dataset]
+# Fifteen independent complete simulation runs per fault family. Splits are
+# stratified by family and ALWAYS made at the complete-run level; no overlapping
+# window is allowed to leak between train/validation/test.
+families = [
+  "healthy",
+  "gyro_bias",
+  "gyro_drift",
+  "gyro_noise",
+  "mag_misalignment",
+  "mag_bias",
+  "sun_noise",
+  "hard_loss",
+  "dropout",
+  "combined_soft",
+]
+runs_per_family = 15
+duration_s = 400.0
+seed = 12001
+split_seed = 12018
+validation_fraction = 0.20
+test_fraction = 0.20
+# More independent trajectories are more valuable than thousands of near-duplicate
+# overlapping windows. Each window still spans 5 s at 10 Hz, but training windows
+# are sampled every 0.5 s to keep RAM/runtime comparable to Experiment 2 v1.
+window_stride_samples = 5
+# Classical FDIR v3.1 is armed at 120 s; training faults start later so each
+# non-healthy run contains a healthy reference interval after arming.
+fault_start_range_s = [160.0, 190.0]
+fault_duration_range_s = [150.0, 190.0]
+initial_attitude_error_max_deg = 25.0
+body_rate_max_rad_s = 0.005
+
+[scenarios.reaction_wheel_ml_fdir_campaign.dataset.orbit_dispersion]
+altitude_half_range_m = 5000.0
+inclination_half_range_deg = 0.10
+raan_half_range_deg = 0.10
+phase_half_range_deg = 180.0
+
+# Context visible to ML is a planned/known orbit, not perfect physical truth.
+# An independent knowledge error is sampled for every complete run.
+[scenarios.reaction_wheel_ml_fdir_campaign.mission_orbit]
+enabled = true
+knowledge_altitude_uncertainty_m = 1000.0
+knowledge_inclination_uncertainty_deg = 0.50
+knowledge_raan_uncertainty_deg = 0.25
+knowledge_phase_uncertainty_deg = 1.0
+
+# Keep the same classical baseline as Experiment 1. Only explicit values here
+# override the v3.1 configuration already defined for the fair recovery campaign.
+[scenarios.reaction_wheel_ml_fdir_campaign.classical_fdir]
+arming_time_s = 120.0
+mode = "classical_v31"
+# After a hard Sun/magnetometer outage, require several independent-consistency
+# samples before ending vector-sensor reacquisition.
+vector_reacquisition_consistency_samples = 10
+
+[scenarios.reaction_wheel_ml_fdir_campaign.evaluation]
+# Independent held-out mission-like trajectories, never used for training or
+# threshold selection. Every severity sweep is repeated with matched seeds: within
+# one repeat all severity levels share pre-fault orbit/attitude/noise/fault RNG.
+# Post-fault trajectories may diverge naturally because severity changes the loop.
+duration_s = 1600.0
+repeats = 4
+fault_start_s = 300.0
+fault_end_s = 1400.0
+seed = 13001
+initial_attitude_error_max_deg = 20.0
+body_rate_max_rad_s = 0.003
+
+gyro_fault_axis = [1.0, -0.7, 0.5]
+gyro_bias_levels_rad_s = [0.001, 0.003, 0.006, 0.012]
+gyro_drift_axis = [1.0, -0.75, 0.5]
+gyro_drift_levels_rad_s2 = [1.0e-6, 3.0e-6, 8.0e-6]
+gyro_noise_levels_rad_s = [8.0e-4, 2.0e-3]
+mag_misalignment_levels_deg = [5.0, 10.0, 20.0, 30.0]
+mag_bias_levels = [0.02, 0.06]
+sun_noise_severities = ["low", "medium", "high"]
+
+# Representative probability plots. All cases are still scored and written to tables.
+probability_plot_cases = [
+  "E_gyro_drift_3e-06",
+  "E_mag_misalignment_20deg",
+  "E_D9_all_three_degraded",
+]

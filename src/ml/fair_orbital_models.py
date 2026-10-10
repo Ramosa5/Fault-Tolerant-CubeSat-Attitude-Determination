@@ -55,18 +55,39 @@ def _rotation_vector_from_dcm(R):
 
 
 def build_orbital_context(states,sun_i,B_i,illumination):
-    """25-feature context foundation excluding measured sensors/masks.
+    """Mission-orbit context used by context-aware recovery models.
 
-    The final per-step feature vector is:
-      measured gyro(3), Sun(3), magnetometer(3), availability masks(3),
-      r_ECI unit(3), v_ECI unit(3), Sun_ECI unit(3), B_ECI unit(3), illumination(1).
+    The context intentionally contains physical state, not absolute elapsed time:
+      r_ECI unit(3), v_ECI unit(3), Sun_ECI unit(3), B_ECI unit(3),
+      illumination(1), sin/cos orbital phase(2), sin/cos beta angle(2).
+
+    Together with measured sensors(9) and availability masks(3), the context-aware
+    variants receive 29 features per timestep.
     """
     r=np.asarray(states[:,:3],float); v=np.asarray(states[:,3:],float)
     rhat=r/(np.linalg.norm(r,axis=1,keepdims=True)+1e-12)
     vhat=v/(np.linalg.norm(v,axis=1,keepdims=True)+1e-12)
     shat=np.asarray(sun_i,float); shat=shat/(np.linalg.norm(shat,axis=1,keepdims=True)+1e-12)
     bhat=np.asarray(B_i,float); bhat=bhat/(np.linalg.norm(bhat,axis=1,keepdims=True)+1e-12)
-    return np.column_stack([rhat,vhat,shat,bhat,np.asarray(illumination,float)]).astype(np.float32)
+
+    # Orbital phase relative to the initial in-plane basis. Encoding with sin/cos
+    # avoids the discontinuity at 0/2pi.
+    e1=rhat[0]
+    h0=_unit(np.cross(rhat[0],vhat[0]))
+    e2=_unit(np.cross(h0,e1))
+    cu=np.clip(rhat@e1,-1.0,1.0)
+    su=np.clip(rhat@e2,-1.0,1.0)
+
+    # Beta angle: angle of the Sun above the orbital plane.
+    hhat=np.cross(rhat,vhat)
+    hhat=hhat/(np.linalg.norm(hhat,axis=1,keepdims=True)+1e-12)
+    sin_beta=np.clip(np.sum(hhat*shat,axis=1),-1.0,1.0)
+    cos_beta=np.sqrt(np.maximum(0.0,1.0-sin_beta*sin_beta))
+
+    return np.column_stack([
+        rhat,vhat,shat,bhat,np.asarray(illumination,float),
+        su,cu,sin_beta,cos_beta
+    ]).astype(np.float32)
 
 
 def build_physics_baseline(states,sun_i,B_i,dt,pointing_axis='x'):
@@ -133,7 +154,7 @@ def _apply_training_degradations(rng,healthy,masks,cfg):
 
 
 def _feature_slice(variant):
-    return slice(0,12) if str(variant)=='sensor_only' else slice(0,25)
+    return slice(0,12) if str(variant)=='sensor_only' else slice(0,29)
 
 
 def _hash_int_array(a):
@@ -141,27 +162,67 @@ def _hash_int_array(a):
 
 
 def generate_shared_dataset(cfg,gyro_noise_std=5e-5,vector_noise_std=2e-3):
-    """Generate one common orbital dataset used by every architecture/variant.
+    """Generate one fair shared dataset for all architectures and variants.
 
-    Splits are performed by complete simulation run IDs, never by overlapping
-    windows, preventing temporal leakage and ensuring fair model comparisons.
+    When [mission_orbit] is enabled, sensor truth is generated on an ``actual``
+    orbit while the context-aware models see a separately perturbed ``known``
+    orbit. This prevents the orbital context from becoming an unrealistically
+    perfect source of truth and lets the training envelope explicitly represent
+    navigation/orbit-knowledge uncertainty.
+
+    Splits are performed by complete simulation run IDs, never overlapping
+    windows, so MLP/CNN/GRU see exactly the same trajectories and samples.
     """
     runs=int(cfg.get('runs',36)); duration=float(cfg.get('duration_s',60.0)); dt=float(cfg.get('dt_s',0.1)); window=int(cfg.get('window',20)); seed=int(cfg.get('seed',97001))
-    rng=np.random.default_rng(seed); X25=[]; Y=[]; BASE=[]; RUN=[]
-    alt_rng=cfg.get('altitude_m_range',[400e3,650e3]); inc_rng=cfg.get('inclination_deg_range',[30.,98.]); epoch0=datetime.fromisoformat(str(cfg.get('epoch_utc','2026-01-01T00:00:00+00:00')).replace('Z','+00:00'))
+    rng=np.random.default_rng(seed); X29=[]; Y=[]; BASE=[]; RUN=[]
+    epoch0=datetime.fromisoformat(str(cfg.get('epoch_utc','2026-01-01T00:00:00+00:00')).replace('Z','+00:00'))
     max_epoch_days=float(cfg.get('epoch_span_days',365.0)); mag_model=str(cfg.get('training_magnetic_field_model','dipole'))
     mask_cfg=cfg.get('masking',{}); degradation_cfg=cfg.get('degradations',{})
+    mission=dict(cfg.get('mission_orbit',{}) or {}); mission_enabled=bool(mission.get('enabled',False))
+    alt_rng=cfg.get('altitude_m_range',[400e3,650e3]); inc_rng=cfg.get('inclination_deg_range',[30.,98.])
     run_meta=[]
+
     for rid in range(runs):
         rr=np.random.default_rng(int(rng.integers(1,2_000_000_000)))
         t=np.arange(0,duration+dt/2,dt); n=len(t)
-        alt=float(rr.uniform(*alt_rng)); inc=float(rr.uniform(*inc_rng)); raan=float(rr.uniform(0,360)); phase=float(rr.uniform(0,360)); epoch=epoch0+timedelta(days=float(rr.uniform(0,max_epoch_days)))
-        states=propagate_circular_two_body(t,alt,inc,raan,phase)
+        epoch=epoch0+timedelta(days=float(rr.uniform(0,max_epoch_days)))
+
+        if mission_enabled:
+            nominal_alt=float(mission.get('nominal_altitude_m',500000.0))
+            nominal_inc=float(mission.get('nominal_inclination_deg',51.6))
+            nominal_raan=float(mission.get('nominal_raan_deg',0.0))
+            nominal_phase=float(mission.get('nominal_phase_deg',0.0))
+
+            actual_alt=nominal_alt+rr.uniform(-float(mission.get('actual_altitude_injection_half_range_m',5000.0)),float(mission.get('actual_altitude_injection_half_range_m',5000.0)))
+            actual_inc=nominal_inc+rr.uniform(-float(mission.get('actual_inclination_injection_half_range_deg',0.10)),float(mission.get('actual_inclination_injection_half_range_deg',0.10)))
+            actual_raan=nominal_raan+rr.uniform(-float(mission.get('actual_raan_injection_half_range_deg',0.10)),float(mission.get('actual_raan_injection_half_range_deg',0.10)))
+            if bool(mission.get('randomize_phase_each_run',True)):
+                actual_phase=float(rr.uniform(0.0,360.0))
+            else:
+                actual_phase=nominal_phase+rr.uniform(-float(mission.get('actual_phase_injection_half_range_deg',1.0)),float(mission.get('actual_phase_injection_half_range_deg',1.0)))
+
+            known_alt=actual_alt+rr.uniform(-float(mission.get('knowledge_altitude_uncertainty_m',1000.0)),float(mission.get('knowledge_altitude_uncertainty_m',1000.0)))
+            known_inc=actual_inc+rr.uniform(-float(mission.get('knowledge_inclination_uncertainty_deg',0.50)),float(mission.get('knowledge_inclination_uncertainty_deg',0.50)))
+            known_raan=actual_raan+rr.uniform(-float(mission.get('knowledge_raan_uncertainty_deg',0.25)),float(mission.get('knowledge_raan_uncertainty_deg',0.25)))
+            known_phase=actual_phase+rr.uniform(-float(mission.get('knowledge_phase_uncertainty_deg',1.0)),float(mission.get('knowledge_phase_uncertainty_deg',1.0)))
+        else:
+            actual_alt=float(rr.uniform(*alt_rng)); actual_inc=float(rr.uniform(*inc_rng)); actual_raan=float(rr.uniform(0,360)); actual_phase=float(rr.uniform(0,360))
+            known_alt,known_inc,known_raan,known_phase=actual_alt,actual_inc,actual_raan,actual_phase
+
+        # Physical truth orbit/environment.
+        states=propagate_circular_two_body(t,actual_alt,actual_inc,actual_raan,actual_phase)
         sun_i,sun_pos=sun_direction_series(t,'analytic',epoch=epoch.isoformat())
         eclipse_state,illum=eclipse_geometry(states[:,:3],sun_pos)
         B_i=magnetic_field_eci(states[:,:3],t,epoch_utc=epoch,model=mag_model)
-        ctx=build_orbital_context(states,sun_i,B_i,illum); base=build_physics_baseline(states,sun_i,B_i,dt)
-        # Start near planned Sun-pointing attitude but vary attitude/rates broadly.
+
+        # What the on-board context provider thinks the orbit is.
+        known_states=propagate_circular_two_body(t,known_alt,known_inc,known_raan,known_phase)
+        known_eclipse,known_illum=eclipse_geometry(known_states[:,:3],sun_pos)
+        known_B_i=magnetic_field_eci(known_states[:,:3],t,epoch_utc=epoch,model=mag_model)
+        ctx=build_orbital_context(known_states,sun_i,known_B_i,known_illum)
+        base=build_physics_baseline(known_states,sun_i,known_B_i,dt)
+
+        # Sensor truth is based on the actual trajectory and attitude.
         C0=desired_sun_orbit_dcm(sun_i[0],states[0,:3],states[0,3:],'x'); qdes=_quat_from_dcm(C0)
         axis=_unit(rr.normal(size=3)); err=np.deg2rad(rr.uniform(0,float(cfg.get('initial_attitude_error_max_deg',35.0))))
         q0=quat_normalize(quat_multiply(axis_angle_quat(axis,err),qdes))
@@ -171,27 +232,44 @@ def generate_shared_dataset(cfg,gyro_noise_std=5e-5,vector_noise_std=2e-3):
         gyro=truth[:,4:]+bias+rng.normal(0,gyro_noise_std,(n,3))
         sun_b=np.zeros((n,3)); mag_b=np.zeros((n,3))
         for k,q in enumerate(truth[:,:4]):
-            C=quat_to_dcm(q); sun_b[k]=_unit(C.T@sun_i[k]+rr.normal(0,vector_noise_std,3)); mag_b[k]=_unit(C.T@_unit(B_i[k])+rr.normal(0,vector_noise_std,3))
+            C=quat_to_dcm(q)
+            sun_b[k]=_unit(C.T@sun_i[k]+rr.normal(0,vector_noise_std,3))
+            mag_b[k]=_unit(C.T@_unit(B_i[k])+rr.normal(0,vector_noise_std,3))
         healthy=np.column_stack([gyro,sun_b,mag_b]).astype(np.float32)
         targets=healthy.copy(); targets[:,:3]=truth[:,4:].astype(np.float32)
+
         masks=_random_mask_pattern(rr,n,p_mask=float(mask_cfg.get('probability',.55)),max_outage_samples=int(mask_cfg.get('max_outage_samples',80)))
-        # Physical eclipse always removes Sun availability in training.
-        masks[eclipse_state==2,1]=0.
+        masks[eclipse_state==2,1]=0.0
         corrupted=_apply_training_degradations(rr,healthy,masks,degradation_cfg)
-        feat=np.column_stack([corrupted,masks,ctx]).astype(np.float32) # 9+3+13=25
+        feat=np.column_stack([corrupted,masks,ctx]).astype(np.float32)  # 9+3+17 = 29
+
         for k in range(window-1,n):
-            X25.append(feat[k-window+1:k+1]); Y.append(targets[k]); BASE.append(base[k]); RUN.append(rid)
-        run_meta.append({'run_id':rid,'altitude_m':alt,'inclination_deg':inc,'raan_deg':raan,'phase_deg':phase,'epoch_utc':epoch.isoformat(),'beta_orbit_training':True})
-    X25=np.asarray(X25,np.float32); Y=np.asarray(Y,np.float32); BASE=np.asarray(BASE,np.float32); RUN=np.asarray(RUN,np.int32)
-    # Split by complete run IDs.
+            X29.append(feat[k-window+1:k+1]); Y.append(targets[k]); BASE.append(base[k]); RUN.append(rid)
+
+        run_meta.append({
+            'run_id':rid,'epoch_utc':epoch.isoformat(),'mission_orbit_context':mission_enabled,
+            'actual_altitude_m':actual_alt,'actual_inclination_deg':actual_inc,'actual_raan_deg':actual_raan,'actual_phase_deg':actual_phase,
+            'known_altitude_m':known_alt,'known_inclination_deg':known_inc,'known_raan_deg':known_raan,'known_phase_deg':known_phase,
+            'inclination_knowledge_error_deg':known_inc-actual_inc,
+            'raan_knowledge_error_deg':known_raan-actual_raan,
+            'phase_knowledge_error_deg':known_phase-actual_phase,
+        })
+
+    X29=np.asarray(X29,np.float32); Y=np.asarray(Y,np.float32); BASE=np.asarray(BASE,np.float32); RUN=np.asarray(RUN,np.int32)
     ids=np.arange(runs); prng=np.random.default_rng(int(cfg.get('split_seed',seed+17))); ids=prng.permutation(ids)
     ftrain=float(cfg.get('train_fraction',.70)); fval=float(cfg.get('validation_fraction',.15)); ntr=max(1,int(round(runs*ftrain))); nva=max(1,int(round(runs*fval)))
     if ntr+nva>=runs: nva=max(1,runs-ntr-1)
     train_ids=np.sort(ids[:ntr]); val_ids=np.sort(ids[ntr:ntr+nva]); test_ids=np.sort(ids[ntr+nva:])
     split={'train_run_ids':train_ids.tolist(),'validation_run_ids':val_ids.tolist(),'test_run_ids':test_ids.tolist()}
-    manifest={'runs':runs,'duration_s':duration,'dt_s':dt,'window':window,'samples':int(len(X25)),'features_context':25,'features_sensor_only':12,'seed':seed,'split_seed':int(cfg.get('split_seed',seed+17)),**split,
-              'train_hash':_hash_int_array(train_ids),'validation_hash':_hash_int_array(val_ids),'test_hash':_hash_int_array(test_ids),'run_metadata':run_meta}
-    return {'X25':X25,'Y':Y,'BASE':BASE,'RUN':RUN,'manifest':manifest}
+    manifest={
+        'runs':runs,'duration_s':duration,'dt_s':dt,'window':window,'samples':int(len(X29)),
+        'features_context':29,'context_only_features':17,'features_sensor_only':12,
+        'seed':seed,'split_seed':int(cfg.get('split_seed',seed+17)),**split,
+        'train_hash':_hash_int_array(train_ids),'validation_hash':_hash_int_array(val_ids),'test_hash':_hash_int_array(test_ids),
+        'mission_orbit_context_enabled':mission_enabled,'run_metadata':run_meta,
+    }
+    # X25 key is retained for backward compatibility with the rest of the project.
+    return {'X25':X29,'Y':Y,'BASE':BASE,'RUN':RUN,'manifest':manifest}
 
 
 def save_shared_dataset(dataset,out_dir,save_npz=True):

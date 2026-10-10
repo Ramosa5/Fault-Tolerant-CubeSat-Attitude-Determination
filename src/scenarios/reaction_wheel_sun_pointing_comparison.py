@@ -299,7 +299,7 @@ def _run_branch(branch, cfg, global_cfg, t, q0, omega0, sun_series, B_i_series,
     # from the injected-fault truth flags used to score its detection performance.
     fdir_mode=str(fdir_mode or 'oracle').lower()
     fdir_cfg=dict(fdir_config or {})
-    classical_fdir=ClassicalConfidenceFDIR(fdir_cfg,dt=dt) if fdir_mode in ('classical','classical_v2') else None
+    classical_fdir=ClassicalConfidenceFDIR(fdir_cfg,dt=dt) if fdir_mode in ('classical','classical_v2','classical_v3','classical_v31') else None
     fdir_conf_gyro=np.ones(n,float); fdir_conf_sun=np.ones(n,float); fdir_conf_mag=np.ones(n,float)
     fdir_state_gyro=np.full(n,HEALTHY,dtype=object); fdir_state_sun=np.full(n,HEALTHY,dtype=object); fdir_state_mag=np.full(n,HEALTHY,dtype=object)
     fdir_flag_gyro=np.zeros(n,bool); fdir_flag_sun=np.zeros(n,bool); fdir_flag_mag=np.zeros(n,bool)
@@ -308,6 +308,12 @@ def _run_branch(branch, cfg, global_cfg, t, q0, omega0, sun_series, B_i_series,
     fdir_sun_innovation=np.full(n,np.nan); fdir_mag_innovation=np.full(n,np.nan)
     fdir_geometry_error=np.full(n,np.nan); fdir_sun_track_error=np.full(n,np.nan); fdir_mag_track_error=np.full(n,np.nan)
     fdir_hard_gyro=np.zeros(n,bool); fdir_hard_sun=np.zeros(n,bool); fdir_hard_mag=np.zeros(n,bool); fdir_sun_expected_unavailable=np.zeros(n,bool)
+    fdir_gyro_soft_ewma=np.zeros(n,float); fdir_sun_soft_ewma=np.zeros(n,float); fdir_mag_soft_ewma=np.zeros(n,float)
+    fdir_gyro_soft_cusum=np.zeros(n,float); fdir_sun_soft_cusum=np.zeros(n,float); fdir_mag_soft_cusum=np.zeros(n,float)
+    fdir_gyro_soft_quality=np.ones(n,float); fdir_sun_soft_quality=np.ones(n,float); fdir_mag_soft_quality=np.ones(n,float)
+    fdir_gyro_soft_evidence=np.zeros(n,float); fdir_sun_soft_evidence=np.zeros(n,float); fdir_mag_soft_evidence=np.zeros(n,float)
+    fdir_gyro_soft_gate=np.zeros(n,bool); fdir_sun_soft_gate=np.zeros(n,bool); fdir_mag_soft_gate=np.zeros(n,bool)
+    fdir_gyro_cross_evidence_valid=np.zeros(n,bool); fdir_gyro_vector_rate_evidence_valid=np.zeros(n,bool)
     fdir_reconstruct_threshold=float(fdir_cfg.get('reconstruction_confidence_threshold',0.25))
     fdir_reject_threshold=float(fdir_cfg.get('reject_confidence_threshold',0.10))
     fdir_vector_min_conf=float(fdir_cfg.get('minimum_vector_confidence_for_update',0.05))
@@ -351,13 +357,20 @@ def _run_branch(branch, cfg, global_cfg, t, q0, omega0, sun_series, B_i_series,
         C_est = quat_to_dcm(qhat[k-1])
         B_body_est = C_est.T @ B_i
 
-        B_meas_for_bdot = mag[k-1] * np.linalg.norm(B_i_series[k-1])
+        # B-dot must never consume a missing/non-finite magnetometer sample.
+        # During magnetometer loss the physical controller cannot form B-dot, so
+        # hold the last finite filtered field and command zero detumbling dipole.
+        # This prevents a single NaN measurement from poisoning the MTQ torque and
+        # then the spacecraft truth state.
+        mag_valid_for_bdot = bool(np.all(np.isfinite(mag[k-1])))
         B_prev_filtered = B_ctrl_filtered.copy()
-        if bdot_filter_tau <= 0:
-            B_ctrl_filtered = B_meas_for_bdot.copy()
-        else:
-            alpha_b = 1.0 - np.exp(-dt / bdot_filter_tau)
-            B_ctrl_filtered = B_ctrl_filtered + alpha_b * (B_meas_for_bdot - B_ctrl_filtered)
+        if mag_valid_for_bdot:
+            B_meas_for_bdot = mag[k-1] * np.linalg.norm(B_i_series[k-1])
+            if bdot_filter_tau <= 0:
+                B_ctrl_filtered = B_meas_for_bdot.copy()
+            else:
+                alpha_b = 1.0 - np.exp(-dt / bdot_filter_tau)
+                B_ctrl_filtered = B_ctrl_filtered + alpha_b * (B_meas_for_bdot - B_ctrl_filtered)
 
         tau_body_cmd = np.zeros(3)
         if sun_pointing_control_enabled(mode[k-1]):
@@ -381,8 +394,11 @@ def _run_branch(branch, cfg, global_cfg, t, q0, omega0, sun_series, B_i_series,
 
         # Deployment-only detumbling via B-dot magnetorquers.
         mtq_det_cmd = np.zeros(3)
-        if mode[k-1] == DETUMBLING:
+        if mode[k-1] == DETUMBLING and mag_valid_for_bdot:
             mtq_det_cmd, bdot[k-1] = bdot_dipole_command(B_ctrl_filtered, B_prev_filtered, dt, bdot_gain, max_dipole, bdot_deadband)
+        elif mode[k-1] == DETUMBLING:
+            mtq_det_cmd = np.zeros(3)
+            bdot[k-1] = np.zeros(3)
 
         # Reaction-wheel torque allocation with optional momentum dumping.
         hw_prev = wheel_h[k-1]
@@ -425,7 +441,7 @@ def _run_branch(branch, cfg, global_cfg, t, q0, omega0, sun_series, B_i_series,
         # Oracle/legacy branches may still use the known fault flag for controlled
         # upper-bound experiments; automatic FDIR updates this reference only after
         # the detector has assessed the current sample below.
-        automatic_fdir = fdir_mode in ('classical','classical_v2') and branch not in ('healthy_mekf','faulty_mekf')
+        automatic_fdir = fdir_mode in ('classical','classical_v2','classical_v3','classical_v31') and branch not in ('healthy_mekf','faulty_mekf')
         if not automatic_fdir:
             if not gyro_faulted[k] and np.all(np.isfinite(gyro[k])):
                 last_good_rate=np.asarray(gyro[k]-bhat[k-1],float).copy()
@@ -489,9 +505,15 @@ def _run_branch(branch, cfg, global_cfg, t, q0, omega0, sun_series, B_i_series,
             fdir_mag_track_error[k]=fd.diagnostics.get('mag_gyro_track_error_deg',np.nan)
             fdir_hard_gyro[k]=bool(fd.hard_unavailable.get('gyro',False)); fdir_hard_sun[k]=bool(fd.hard_unavailable.get('sun',False)); fdir_hard_mag[k]=bool(fd.hard_unavailable.get('mag',False))
             fdir_sun_expected_unavailable[k]=bool(fd.expected_unavailable.get('sun',False))
+            fdir_gyro_soft_ewma[k]=fd.diagnostics.get('gyro_soft_ewma',0.0); fdir_sun_soft_ewma[k]=fd.diagnostics.get('sun_soft_ewma',0.0); fdir_mag_soft_ewma[k]=fd.diagnostics.get('mag_soft_ewma',0.0)
+            fdir_gyro_soft_cusum[k]=fd.diagnostics.get('gyro_soft_cusum',0.0); fdir_sun_soft_cusum[k]=fd.diagnostics.get('sun_soft_cusum',0.0); fdir_mag_soft_cusum[k]=fd.diagnostics.get('mag_soft_cusum',0.0)
+            fdir_gyro_soft_quality[k]=fd.diagnostics.get('gyro_soft_quality',1.0); fdir_sun_soft_quality[k]=fd.diagnostics.get('sun_soft_quality',1.0); fdir_mag_soft_quality[k]=fd.diagnostics.get('mag_soft_quality',1.0)
+            fdir_gyro_soft_evidence[k]=fd.diagnostics.get('gyro_soft_evidence',0.0); fdir_sun_soft_evidence[k]=fd.diagnostics.get('sun_soft_evidence',0.0); fdir_mag_soft_evidence[k]=fd.diagnostics.get('mag_soft_evidence',0.0)
+            fdir_gyro_soft_gate[k]=bool(fd.diagnostics.get('gyro_soft_gate_active',0.0)); fdir_sun_soft_gate[k]=bool(fd.diagnostics.get('sun_soft_gate_active',0.0)); fdir_mag_soft_gate[k]=bool(fd.diagnostics.get('mag_soft_gate_active',0.0))
+            fdir_gyro_cross_evidence_valid[k]=bool(fd.diagnostics.get('gyro_cross_evidence_valid',0.0)); fdir_gyro_vector_rate_evidence_valid[k]=bool(fd.diagnostics.get('gyro_vector_rate_evidence_valid',0.0))
             gyro_bad_detected=bool(fdir_flag_gyro[k]); sun_bad_detected=bool(fdir_flag_sun[k]); mag_bad_detected=bool(fdir_flag_mag[k])
 
-            # Automatic FDIR v2 fallback update. No injected-fault labels are used.
+            # Automatic FDIR v3.1 fallback update. No injected-fault labels are used.
             if np.all(np.isfinite(gyro[k])) and not fdir_hard_gyro[k] and fdir_conf_gyro[k] >= float(fdir_cfg.get('trusted_reference_update_confidence',0.95)) and fdir_state_gyro[k] == HEALTHY:
                 last_good_rate=np.asarray(gyro[k]-bhat[k-1],float).copy()
             elif gyro_fallback_tau_s>0:
@@ -538,7 +560,7 @@ def _run_branch(branch, cfg, global_cfg, t, q0, omega0, sun_series, B_i_series,
             # Gyro is a propagation input rather than an EKF measurement, therefore
             # degraded gyro data are blended toward the last trusted rate; complete
             # loss/fault falls back fully to the trusted-rate estimate.
-            if fdir_mode in ('classical','classical_v2'):
+            if fdir_mode in ('classical','classical_v2','classical_v3','classical_v31'):
                 cg=float(np.clip(fdir_conf_gyro[k],0.0,1.0))
                 gyro_fb=np.asarray(last_good_rate,float)+np.asarray(bhat[k-1],float)
                 if not np.all(np.isfinite(gyro[k])) or cg<=fdir_reject_threshold:
@@ -686,6 +708,12 @@ def _run_branch(branch, cfg, global_cfg, t, q0, omega0, sun_series, B_i_series,
         fdir_sun_innovation=fdir_sun_innovation, fdir_mag_innovation=fdir_mag_innovation,
         fdir_geometry_error=fdir_geometry_error, fdir_sun_track_error=fdir_sun_track_error, fdir_mag_track_error=fdir_mag_track_error,
         fdir_hard_gyro=fdir_hard_gyro, fdir_hard_sun=fdir_hard_sun, fdir_hard_mag=fdir_hard_mag, fdir_sun_expected_unavailable=fdir_sun_expected_unavailable,
+        fdir_gyro_soft_ewma=fdir_gyro_soft_ewma, fdir_sun_soft_ewma=fdir_sun_soft_ewma, fdir_mag_soft_ewma=fdir_mag_soft_ewma,
+        fdir_gyro_soft_cusum=fdir_gyro_soft_cusum, fdir_sun_soft_cusum=fdir_sun_soft_cusum, fdir_mag_soft_cusum=fdir_mag_soft_cusum,
+        fdir_gyro_soft_quality=fdir_gyro_soft_quality, fdir_sun_soft_quality=fdir_sun_soft_quality, fdir_mag_soft_quality=fdir_mag_soft_quality,
+        fdir_gyro_soft_evidence=fdir_gyro_soft_evidence, fdir_sun_soft_evidence=fdir_sun_soft_evidence, fdir_mag_soft_evidence=fdir_mag_soft_evidence,
+        fdir_gyro_soft_gate=fdir_gyro_soft_gate, fdir_sun_soft_gate=fdir_sun_soft_gate, fdir_mag_soft_gate=fdir_mag_soft_gate,
+        fdir_gyro_cross_evidence_valid=fdir_gyro_cross_evidence_valid, fdir_gyro_vector_rate_evidence_valid=fdir_gyro_vector_rate_evidence_valid,
         mode=mode, mode_code=mode_code, control_on=control_on, rate_damping_on=rate_damping_on,
         true_point=true_point, est_point=est_point, att_err=att_err, sun_rec_err=sun_rec_err, inertia=inertia,
     )

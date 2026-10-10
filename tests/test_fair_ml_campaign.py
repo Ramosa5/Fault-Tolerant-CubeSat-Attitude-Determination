@@ -29,7 +29,7 @@ def test_shared_dataset_split_is_by_complete_runs_and_disjoint():
 def test_variant_feature_dimensions_and_common_sample_count():
     d=generate_shared_dataset(_tiny_dataset_cfg())
     counts=[]
-    for variant,nf in [('sensor_only',12),('orbital_context',25),('physics_residual',25)]:
+    for variant,nf in [('sensor_only',12),('orbital_context',29),('physics_residual',29)]:
         X,Y=prepare_variant_target(d,variant,'gyro'); counts.append(len(X)); assert X.shape[-1]==nf; assert Y.shape[-1]==3
     assert len(set(counts))==1
 
@@ -56,8 +56,9 @@ def test_config_disables_animations_and_registers_fair_campaign():
     root=Path(__file__).resolve().parents[1]
     cfg=tomllib.loads((root/'experiment_config.toml').read_text())
     sc=cfg['scenarios']['reaction_wheel_fair_ml_campaign']
-    assert cfg['scenario']['active']=='reaction_wheel_fair_ml_campaign'
+    assert cfg['scenario']['active']=='reaction_wheel_ml_fdir_campaign'
     assert sc['animation']['enabled'] is False
+    assert sc['fdir']['mode']=='classical_v31'
     assert 'reaction_wheel_fair_ml_campaign' in SCENARIOS
 
 
@@ -83,3 +84,54 @@ def test_config_defaults_to_group_d_only_for_next_campaign():
     fc=cfg['scenarios']['reaction_wheel_fair_ml_campaign']['fault_scenarios']
     assert fc['groups']==['D']
     assert len(fc['combined_cases'])==10
+
+
+def test_mission_orbit_context_uses_imperfect_known_orbit():
+    c=_tiny_dataset_cfg()
+    c['mission_orbit']={
+        'enabled':True,'nominal_altitude_m':500000.,'nominal_inclination_deg':51.6,
+        'nominal_raan_deg':0.,'randomize_phase_each_run':True,
+        'actual_inclination_injection_half_range_deg':0.1,
+        'knowledge_inclination_uncertainty_deg':0.5,
+        'knowledge_altitude_uncertainty_m':1000.,
+        'knowledge_raan_uncertainty_deg':0.25,'knowledge_phase_uncertainty_deg':1.0,
+    }
+    d=generate_shared_dataset(c)
+    assert d['X25'].shape[-1]==29
+    assert d['manifest']['mission_orbit_context_enabled'] is True
+    errs=[abs(x['inclination_knowledge_error_deg']) for x in d['manifest']['run_metadata']]
+    assert max(errs)<=0.5000001
+    assert any(x>1e-6 for x in errs)
+
+
+def test_runtime_mission_context_accepts_string_epoch():
+    import numpy as np
+    from src.scenarios.reaction_wheel_fair_ml_campaign import _runtime_mission_context
+    from src.simulation.orbit_model import propagate_circular_two_body
+    from src.simulation.illumination import sun_direction_series, eclipse_geometry
+    from src.simulation.magnetic_field import magnetic_field_eci
+    from datetime import datetime, timezone
+
+    t=np.arange(0.0,2.0,0.2)
+    actual=propagate_circular_two_body(t,500000.0,51.6,0.0,0.0)
+    sun,sun_pos=sun_direction_series(t,'analytic',epoch='2026-01-01T00:00:00+00:00')
+    _,illum=eclipse_geometry(actual[:,:3],sun_pos)
+    B=magnetic_field_eci(actual[:,:3],t,epoch_utc=datetime(2026,1,1,tzinfo=timezone.utc),model='dipole')
+
+    base={
+        'pointing_axis':'x',
+        'illumination':{'epoch_utc':'2026-01-01T00:00:00+00:00'},
+        'magnetic_field':{'model':'dipole'},
+    }
+    global_cfg={'orbit':{'altitude_m':500000.0,'inclination_deg':51.6,'raan_deg':0.0,'phase_deg':0.0}}
+    dcfg={'mission_orbit':{
+        'enabled':True,
+        'runtime_knowledge_inclination_error_deg':0.25,
+        'runtime_knowledge_altitude_error_m':0.0,
+        'runtime_knowledge_raan_error_deg':0.0,
+        'runtime_knowledge_phase_error_deg':0.0,
+    }}
+    ctx,baseline,meta=_runtime_mission_context(t,base,global_cfg,dcfg,sun,sun_pos,actual,B,illum)
+    assert ctx.shape==(len(t),17)
+    assert baseline.shape==(len(t),9)
+    assert meta['enabled'] is True

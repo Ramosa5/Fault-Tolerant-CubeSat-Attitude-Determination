@@ -104,7 +104,7 @@ class FDIRResult:
 
 
 class ClassicalConfidenceFDIR:
-    """Classical confidence-based FDIR v2.
+    """Classical confidence-based FDIR v3.1.
 
     The detector separates three concepts:
       1) hard sample availability (loss/dropout/missing data),
@@ -139,6 +139,13 @@ class ClassicalConfidenceFDIR:
         self.vector_stuck_motion_min_deg = float(c.get('vector_stuck_motion_min_deg', 0.05))
         self.availability_recovery_grace_samples = max(0, int(c.get('availability_recovery_grace_samples', 5)))
         self.gyro_reacquisition_consistency_samples = max(1, int(c.get('gyro_reacquisition_consistency_samples', 20)))
+        # Vector-sensor recovery after a hard outage is validated against an
+        # independent absolute reference (Sun/B geometry first, gyro-track second).
+        # This prevents a healthy returning magnetometer from remaining falsely
+        # DEGRADED/FAULTY because the estimator drifted while the sensor was absent.
+        self.vector_reacquisition_consistency_samples = max(
+            1, int(c.get('vector_reacquisition_consistency_samples', 10))
+        )
 
         # Gyro residual thresholds.
         self.gyro_rate_warn = float(c.get('gyro_rate_residual_warn_rad_s', 0.0025))
@@ -169,6 +176,25 @@ class ClassicalConfidenceFDIR:
         self.geometry_consistent_innovation_floor = float(c.get('geometry_consistent_innovation_quality_floor', 0.90))
         self.ambiguous_geometry_quality_floor = float(c.get('ambiguous_geometry_quality_floor', 0.45))
 
+        # v3.1 persistent soft-fault layer.
+        # Sensor-specific anomaly evidence is EWMA-smoothed, then integrated by a
+        # time-scaled LEAKY CUSUM only above a gate. This prevents healthy residual
+        # noise from accumulating indefinitely.
+        self.soft_ewma_alpha = float(np.clip(c.get('soft_ewma_alpha', 0.05), 0.0, 1.0))
+        self.soft_cusum_gate = float(np.clip(c.get('soft_cusum_gate', 0.15), 0.0, 1.0))
+        self.soft_cusum_leak_tau_s = float(max(c.get('soft_cusum_leak_tau_s', 60.0), self.dt))
+        self.soft_cusum_reset_tau_s = float(max(c.get('soft_cusum_reset_tau_s', 3.0), self.dt))
+        self.soft_cusum_warn = float(c.get('soft_cusum_warn_score_s', 2.0))
+        self.soft_cusum_fault = float(c.get('soft_cusum_fault_score_s', 8.0))
+        self.soft_accumulator_weight = float(np.clip(c.get('soft_accumulator_weight', 0.65), 0.0, 1.0))
+
+        # Calibrated against the healthy pre-fault portion of the latest campaign.
+        # These are conservative defaults and should be frozen before held-out tests.
+        self.gyro_vector_rate_warn = float(c.get('gyro_vector_rate_warn_rad_s', 0.024))
+        self.gyro_vector_rate_fault = float(c.get('gyro_vector_rate_fault_rad_s', 0.050))
+        self.gyro_reference_rate_warn = float(c.get('gyro_reference_rate_warn_rad_s', 0.010))
+        self.gyro_reference_rate_fault = float(c.get('gyro_reference_rate_fault_rad_s', 0.040))
+
         self.weights = {
             'range': float(c.get('weight_range', 0.20)),
             'innovation': float(c.get('weight_innovation', 0.35)),
@@ -196,9 +222,47 @@ class ClassicalConfidenceFDIR:
         self.recovery_grace = {'gyro': 0, 'sun': 0, 'mag': 0}
         self.gyro_reacquiring = False
         self.gyro_reacquire_good_count = 0
+        self.vector_reacquiring = {'sun': False, 'mag': False}
+        self.vector_reacquire_good_count = {'sun': 0, 'mag': 0}
         self.triad_anchor_C = None
         self.triad_anchor_step = 0
         self.coarse_vector_rate = None
+        self.soft_ewma = {'gyro':0.0,'sun':0.0,'mag':0.0}
+        self.soft_cusum = {'gyro':0.0,'sun':0.0,'mag':0.0}
+        self.soft_quality = {'gyro':1.0,'sun':1.0,'mag':1.0}
+        self.soft_evidence = {'gyro':0.0,'sun':0.0,'mag':0.0}
+        self.soft_gate_active = {'gyro':False,'sun':False,'mag':False}
+
+    def _reset_soft_accumulator(self, sensor):
+        self.soft_ewma[sensor] = 0.0
+        self.soft_cusum[sensor] = 0.0
+        self.soft_quality[sensor] = 1.0
+        self.soft_evidence[sensor] = 0.0
+        self.soft_gate_active[sensor] = False
+
+    def _update_soft_accumulator(self, sensor, evidence, active=True):
+        """EWMA + leaky time-scaled CUSUM for persistent soft faults."""
+        if not active:
+            self._reset_soft_accumulator(sensor)
+            return 1.0
+
+        ev=float(np.clip(evidence,0.0,1.0))
+        self.soft_evidence[sensor]=ev
+        self.soft_ewma[sensor]=(1.0-self.soft_ewma_alpha)*self.soft_ewma[sensor]+self.soft_ewma_alpha*ev
+
+        if self.soft_ewma[sensor] > self.soft_cusum_gate:
+            leak=float(np.exp(-self.dt/self.soft_cusum_leak_tau_s))
+            increment=(self.soft_ewma[sensor]-self.soft_cusum_gate)*self.dt
+            self.soft_cusum[sensor]=max(0.0, leak*self.soft_cusum[sensor]+increment)
+            self.soft_gate_active[sensor]=True
+        else:
+            reset_leak=float(np.exp(-self.dt/self.soft_cusum_reset_tau_s))
+            self.soft_cusum[sensor]=max(0.0, reset_leak*self.soft_cusum[sensor])
+            self.soft_gate_active[sensor]=False
+
+        q=_quality(self.soft_cusum[sensor],self.soft_cusum_warn,self.soft_cusum_fault)
+        self.soft_quality[sensor]=q
+        return q
 
     def _state_update(self, sensor, raw_conf, hard_unavailable=False, expected_unavailable=False):
         if expected_unavailable:
@@ -278,8 +342,16 @@ class ClassicalConfidenceFDIR:
 
         hard_now = {'gyro': gyro_hard_unavailable, 'sun': sun_hard_unavailable, 'mag': mag_hard_unavailable}
         for sensor in ('gyro','sun','mag'):
+            if hard_now[sensor]:
+                self._reset_soft_accumulator(sensor)
             if self.prev_hard.get(sensor, False) and not hard_now[sensor]:
                 self.recovery_grace[sensor] = self.availability_recovery_grace_samples
+                self._reset_soft_accumulator(sensor)
+                if sensor in ('sun','mag'):
+                    self.vector_reacquiring[sensor] = True
+                    self.vector_reacquire_good_count[sensor] = 0
+        if expected_sun_unavailable:
+            self._reset_soft_accumulator('sun')
         # A gyro track accumulated before a hard loss is stale when samples return.
         # Re-anchor on the current estimator state before evaluating soft consistency.
         if self.prev_hard.get('gyro', False) and not gyro_hard_unavailable:
@@ -426,6 +498,18 @@ class ClassicalConfidenceFDIR:
         sun_innov_q = _quality(sun_innov, self.sun_innov_warn, self.sun_innov_fault) if sun_available else 0.0
         mag_innov_q = _quality(mag_innov, self.mag_innov_warn, self.mag_innov_fault) if mag_available else 0.0
 
+        # v3.1: do not use MEKF innovation to choose a victim when the independent
+        # Sun/B geometry says the pair is inconsistent. Isolation must come from the
+        # gyro-track comparison; ambiguous pair disagreement remains diagnostic only.
+        if sun_available and mag_available and np.isfinite(geometry_error) and not geometry_consistent:
+            if isolated_vector == 'mag':
+                sun_innov_q = 1.0
+            elif isolated_vector == 'sun':
+                mag_innov_q = 1.0
+            elif isolated_vector == 'ambiguous':
+                sun_innov_q = 1.0
+                mag_innov_q = 1.0
+
         # Protect a mutually consistent pair from a drifting MEKF estimate.
         if geometry_consistent:
             sun_innov_q = max(sun_innov_q, self.geometry_consistent_innovation_floor)
@@ -466,10 +550,27 @@ class ClassicalConfidenceFDIR:
             'temporal': 0.0 if mag_stuck_effective else mag_temporal_q,
             'cross': mag_cross_q,
         }
-        gyro_cross_q = _quality(gyro_cross, self.gyro_cross_warn, self.gyro_cross_fault) if np.isfinite(gyro_cross) else 1.0
-        gyro_rate_q = (_quality(gyro_vector_rate_residual, self.gyro_rate_warn, self.gyro_rate_fault)
-                       if np.isfinite(gyro_vector_rate_residual) else
-                       (_quality(gyro_rate_residual, self.gyro_rate_warn, self.gyro_rate_fault) if gyro_available else 0.0))
+        # v3.1: gyro soft evidence is valid only when Sun and magnetic vectors form a
+        # mutually consistent absolute reference. A bad/missing vector therefore
+        # cannot build a persistent false accusation against a healthy gyro.
+        gyro_cross_evidence_valid = bool(geometry_consistent and np.isfinite(gyro_cross))
+        gyro_vector_rate_valid = bool(geometry_consistent and np.isfinite(gyro_vector_rate_residual))
+
+        gyro_cross_q = (_quality(gyro_cross, self.gyro_cross_warn, self.gyro_cross_fault)
+                        if gyro_cross_evidence_valid else 1.0)
+        gyro_vector_rate_q = (_quality(gyro_vector_rate_residual,
+                                       self.gyro_vector_rate_warn,
+                                       self.gyro_vector_rate_fault)
+                              if gyro_vector_rate_valid else 1.0)
+
+        # Last-trusted-rate residual is only a weak instantaneous sanity check. It is
+        # deliberately excluded from CUSUM because legitimate control motion changes rate.
+        gyro_reference_rate_q = (_quality(gyro_rate_residual,
+                                          self.gyro_reference_rate_warn,
+                                          self.gyro_reference_rate_fault)
+                                 if gyro_available and np.isfinite(gyro_rate_residual) else 1.0)
+        gyro_rate_q = min(gyro_vector_rate_q, gyro_reference_rate_q)
+
         gyro_q = {
             'range': 1.0 if gyro_available and rate_norm <= self.gyro_abs_limit else _quality(gyro_abs_excess, 0.0, max(self.gyro_abs_limit, 1e-6)),
             'innovation': gyro_cross_q,
@@ -486,12 +587,38 @@ class ClassicalConfidenceFDIR:
             'mag': combine(mag_q) if mag_available else 0.0,
         }
 
+        # Sensor-specific persistent evidence in [0,1].
+        gyro_soft_evidence = 0.0
+        if gyro_vector_rate_valid:
+            gyro_soft_evidence=max(gyro_soft_evidence,1.0-gyro_vector_rate_q)
+        if gyro_cross_evidence_valid:
+            gyro_soft_evidence=max(gyro_soft_evidence,1.0-gyro_cross_q)
+
+        # Vector persistent evidence excludes MEKF innovation. Only direct range /
+        # temporal evidence and attitude-independent Sun/B isolation are integrated.
+        sun_soft_evidence = max(1.0-sun_q['range'], 1.0-sun_temporal_q) if sun_available else 0.0
+        mag_soft_evidence = max(1.0-mag_q['range'], 1.0-mag_temporal_q) if mag_available else 0.0
+        if isolated_vector == 'sun':
+            sun_soft_evidence=max(sun_soft_evidence,1.0-sun_cross_q)
+        elif isolated_vector == 'mag':
+            mag_soft_evidence=max(mag_soft_evidence,1.0-mag_cross_q)
+
+        availability = {'gyro':gyro_available,'sun':sun_available,'mag':mag_available}
+        expected_unavail = {'gyro':False,'sun':expected_sun_unavailable,'mag':False}
+        evidence = {'gyro':gyro_soft_evidence,'sun':sun_soft_evidence,'mag':mag_soft_evidence}
+        for sensor in ('gyro','sun','mag'):
+            # Hard loss, eclipse, and packet re-entry grace reset persistent evidence.
+            active=bool(availability[sensor] and not expected_unavail[sensor] and self.recovery_grace[sensor] <= 0)
+            sq=self._update_soft_accumulator(sensor,evidence[sensor],active=active)
+            persistent_cap=(1.0-self.soft_accumulator_weight)+self.soft_accumulator_weight*sq
+            raw[sensor]=min(raw[sensor],persistent_cap)
+
         # Soft-fault recovery uses the estimator-independent two-vector rate. Once
         # Sun and magnetic geometry is again consistent and the current gyro agrees
         # with the TRIAD-derived rate, a stale gyro-track disagreement accumulated
         # during the fault is cleared and the track is re-anchored from TRIAD.
         vector_rate_support = (geometry_consistent and np.isfinite(gyro_vector_rate_residual) and
-                               gyro_vector_rate_residual <= 2.0*self.gyro_rate_warn)
+                               gyro_vector_rate_residual <= self.gyro_vector_rate_warn)
         if self.state['gyro'] in (FAULTY, DEGRADED) and vector_rate_support:
             raw['gyro'] = max(raw['gyro'], self.healthy_recovery_threshold + 0.08)
             if Ctriad is not None:
@@ -515,6 +642,40 @@ class ClassicalConfidenceFDIR:
             if self.gyro_reacquire_good_count >= self.gyro_reacquisition_consistency_samples:
                 self.gyro_reacquiring = False
                 self.gyro_reacquire_good_count = 0
+
+        # Vector-sensor reacquisition after hard loss/dropout. A returning vector is
+        # provisionally trusted only when an estimator-independent consistency check
+        # supports it. For magnetometer recovery, Sun/B geometry is preferred; for
+        # Sun recovery, the same pair geometry is used. If the companion vector is
+        # unavailable, a trusted gyro-track comparison is used as a secondary check.
+        for sensor in ('sun','mag'):
+            if not self.vector_reacquiring[sensor]:
+                continue
+            available = sun_available if sensor == 'sun' else mag_available
+            if not available:
+                self.vector_reacquire_good_count[sensor] = 0
+                continue
+
+            support = False
+            if sun_available and mag_available and np.isfinite(geometry_error):
+                support = bool(geometry_error <= self.vector_geometry_warn_deg)
+            elif prior_conf['gyro'] >= self.degraded_threshold:
+                track_err = sun_track_err if sensor == 'sun' else mag_track_err
+                track_warn = self.sun_innov_warn if sensor == 'sun' else self.mag_innov_warn
+                support = bool(np.isfinite(track_err) and track_err <= track_warn)
+
+            if support:
+                self.vector_reacquire_good_count[sensor] += 1
+                # During validated reacquisition, stale MEKF innovation must not
+                # suppress a physically consistent returning measurement.
+                raw[sensor] = max(raw[sensor], self.healthy_recovery_threshold + 0.08)
+            else:
+                self.vector_reacquire_good_count[sensor] = 0
+
+            if self.vector_reacquire_good_count[sensor] >= self.vector_reacquisition_consistency_samples:
+                self.vector_reacquiring[sensor] = False
+                self.vector_reacquire_good_count[sensor] = 0
+                self._reset_soft_accumulator(sensor)
 
         # Valid packets immediately following a hard availability outage receive a
         # short re-entry grace period. This prevents stale estimator/gyro-track errors
@@ -570,6 +731,27 @@ class ClassicalConfidenceFDIR:
             'raw_gyro_confidence': raw['gyro'],
             'raw_sun_confidence': raw['sun'],
             'raw_mag_confidence': raw['mag'],
+            'gyro_soft_ewma': self.soft_ewma['gyro'],
+            'sun_soft_ewma': self.soft_ewma['sun'],
+            'mag_soft_ewma': self.soft_ewma['mag'],
+            'gyro_soft_cusum': self.soft_cusum['gyro'],
+            'sun_soft_cusum': self.soft_cusum['sun'],
+            'mag_soft_cusum': self.soft_cusum['mag'],
+            'gyro_soft_quality': self.soft_quality['gyro'],
+            'sun_soft_quality': self.soft_quality['sun'],
+            'mag_soft_quality': self.soft_quality['mag'],
+            'gyro_soft_evidence': self.soft_evidence['gyro'],
+            'sun_soft_evidence': self.soft_evidence['sun'],
+            'mag_soft_evidence': self.soft_evidence['mag'],
+            'gyro_soft_gate_active': float(self.soft_gate_active['gyro']),
+            'sun_soft_gate_active': float(self.soft_gate_active['sun']),
+            'mag_soft_gate_active': float(self.soft_gate_active['mag']),
+            'gyro_cross_evidence_valid': float(gyro_cross_evidence_valid),
+            'gyro_vector_rate_evidence_valid': float(gyro_vector_rate_valid),
+            'sun_reacquiring': float(self.vector_reacquiring['sun']),
+            'mag_reacquiring': float(self.vector_reacquiring['mag']),
+            'sun_reacquire_good_count': float(self.vector_reacquire_good_count['sun']),
+            'mag_reacquire_good_count': float(self.vector_reacquire_good_count['mag']),
         }
         return FDIRResult(confidence=dict(self.conf), state=dict(self.state), score=score,
                           diagnostics=diagnostics, hard_unavailable=hard, expected_unavailable=expected)

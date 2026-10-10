@@ -97,3 +97,11 @@ python run_project.py
 ```
 
 The included 4 kg / 0.34 x 0.10 x 0.10 m spacecraft and 0.4 A m^2 magnetorquers are representative defaults, not mission-specific values. Replace them with the actual spacecraft mass properties and actuator datasheet values before treating results as mission predictions.
+
+## Experiment 2: ML-assisted FDIR
+
+The active scenario is now `reaction_wheel_ml_fdir_campaign`. It preserves the
+previous `reaction_wheel_fair_ml_campaign` as Experiment 1 (ML virtual-sensor
+recovery) and adds a separate detection/isolation experiment comparing classical
+FDIR v3.1, pure MLP/CNN/GRU fault detectors, and hybrid classical-hard + ML-soft
+FDIR. See `ML_FDIR_EXPERIMENT_GUIDE.md` for the full methodology and output list.

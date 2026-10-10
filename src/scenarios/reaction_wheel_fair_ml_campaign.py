@@ -1,14 +1,18 @@
 from __future__ import annotations
 from pathlib import Path
+from datetime import datetime, timezone
 import copy, json
 import numpy as np
 import pandas as pd
 
 from src.simulation.control import sun_pointing_initial_quaternion
+from src.simulation.orbit_model import propagate_circular_two_body
+from src.simulation.magnetic_field import magnetic_field_eci
+from src.simulation.illumination import eclipse_geometry
 from src.scenarios.reaction_wheel_sun_pointing_comparison import _make_environment, _run_branch
 from src.ml.fair_orbital_models import (
     generate_shared_dataset, save_shared_dataset, train_fair_model_matrix,
-    build_orbital_context, build_physics_baseline,
+    build_orbital_context, build_physics_baseline, prepare_variant_target,
 )
 from src.visualization.publication import PALETTE, create_subplots, finalize_figure
 from src.visualization.animation import create_orbit_attitude_animation
@@ -71,6 +75,86 @@ def _branch_specs(cfg):
             specs.append((f'{a}_{v}',a,v,f'{a.upper()} — {v.replace("_"," ")}'))
     return specs
 
+
+
+
+def _runtime_mission_context(t, base, global_cfg, dataset_cfg, sun_i, sun_pos, actual_states, actual_B_i, actual_illum):
+    """Build the context visible to ML from the *known/planned* orbit.
+
+    The spacecraft dynamics still use actual_states. Context errors are configured
+    independently, so context-aware models are never given perfect truth by accident.
+    """
+    mission=dict(dataset_cfg.get('mission_orbit',{}) or {})
+    if not bool(mission.get('enabled',False)):
+        return build_orbital_context(actual_states,sun_i,actual_B_i,actual_illum), build_physics_baseline(actual_states,sun_i,actual_B_i,float(t[1]-t[0]),str(base.get('pointing_axis','x'))), {'enabled':False}
+
+    ocfg=global_cfg.get('orbit',{})
+    alt=float(ocfg.get('altitude_m',mission.get('nominal_altitude_m',500000.0)))
+    inc=float(ocfg.get('inclination_deg',mission.get('nominal_inclination_deg',51.6)))
+    raan=float(ocfg.get('raan_deg',mission.get('nominal_raan_deg',0.0)))
+    phase=float(ocfg.get('phase_deg',mission.get('nominal_phase_deg',0.0)))
+
+    k_alt=alt+float(mission.get('runtime_knowledge_altitude_error_m',0.0))
+    k_inc=inc+float(mission.get('runtime_knowledge_inclination_error_deg',0.25))
+    k_raan=raan+float(mission.get('runtime_knowledge_raan_error_deg',0.0))
+    k_phase=phase+float(mission.get('runtime_knowledge_phase_error_deg',0.0))
+    known_states=propagate_circular_two_body(t,k_alt,k_inc,k_raan,k_phase)
+
+    epoch_raw=base.get('illumination',{}).get('epoch_utc','2026-01-01T00:00:00+00:00')
+    if isinstance(epoch_raw, datetime):
+        epoch=epoch_raw
+    else:
+        epoch=datetime.fromisoformat(str(epoch_raw).replace('Z','+00:00'))
+    if epoch.tzinfo is None:
+        epoch=epoch.replace(tzinfo=timezone.utc)
+
+    model=str(base.get('magnetic_field',{}).get('model','dipole'))
+    known_B=magnetic_field_eci(known_states[:,:3],t,epoch_utc=epoch,model=model)
+    _,known_illum=eclipse_geometry(known_states[:,:3],sun_pos)
+    ctx=build_orbital_context(known_states,sun_i,known_B,known_illum)
+    baseline=build_physics_baseline(known_states,sun_i,known_B,float(t[1]-t[0]),str(base.get('pointing_axis','x')))
+    return ctx,baseline,{'enabled':True,'known_altitude_m':k_alt,'known_inclination_deg':k_inc,'known_raan_deg':k_raan,'known_phase_deg':k_phase}
+
+
+def _evaluate_orbit_uncertainty_sweep(bundles, dataset_cfg, sweep_cfg, gyro_noise_std, vector_noise_std):
+    """Evaluate already trained networks on identical synthetic trajectories while
+    changing only the inclination-knowledge uncertainty envelope.
+    """
+    if not bool(sweep_cfg.get('enabled',False)):
+        return pd.DataFrame()
+    levels=[float(x) for x in sweep_cfg.get('inclination_uncertainty_deg',[0.0,0.1,0.25,0.5,1.0])]
+    rows=[]
+    base_cfg=copy.deepcopy(dataset_cfg)
+    base_cfg['runs']=int(sweep_cfg.get('runs',8))
+    base_cfg['duration_s']=float(sweep_cfg.get('duration_s',30.0))
+    base_cfg['seed']=int(sweep_cfg.get('seed',97555))
+    base_cfg['split_seed']=int(sweep_cfg.get('split_seed',97572))
+    for level in levels:
+        c=copy.deepcopy(base_cfg); c.setdefault('mission_orbit',{})['enabled']=True; c['mission_orbit']['knowledge_inclination_uncertainty_deg']=level
+        d=generate_shared_dataset(c,gyro_noise_std=gyro_noise_std,vector_noise_std=vector_noise_std)
+        for (arch,variant),bundle in bundles.items():
+            for target,pred in bundle.predictors.items():
+                X,_=prepare_variant_target(d,variant,target)
+                xs=(X-pred.scaler.xmu)/pred.scaler.xsd
+                out=[]
+                batch=int(sweep_cfg.get('batch_size',1024))
+                import torch
+                with torch.no_grad():
+                    for i in range(0,len(xs),batch):
+                        yy=pred.model(torch.from_numpy(xs[i:i+batch])).numpy()*pred.scaler.ysd+pred.scaler.ymu
+                        out.append(yy)
+                yhat=np.vstack(out)
+                sl={'gyro':slice(0,3),'sun':slice(3,6),'mag':slice(6,9)}[target]
+                if variant=='physics_residual':
+                    yhat=yhat+d['BASE'][:,sl]
+                ytrue=d['Y'][:,sl]
+                if target=='gyro':
+                    metric=float(np.sqrt(np.mean(np.sum((yhat-ytrue)**2,axis=1)))); metric_name='rmse_rad_s'
+                else:
+                    yp=yhat/(np.linalg.norm(yhat,axis=1,keepdims=True)+1e-12); yt=ytrue/(np.linalg.norm(ytrue,axis=1,keepdims=True)+1e-12)
+                    a=np.degrees(np.arccos(np.clip(np.sum(yp*yt,axis=1),-1,1))); metric=float(np.sqrt(np.mean(a*a))); metric_name='angular_rmse_deg'
+                rows.append({'inclination_uncertainty_deg':level,'architecture':arch,'variant':variant,'target_sensor':target,'metric':metric_name,'value':metric,'samples':len(X)})
+    return pd.DataFrame(rows)
 
 
 def _generated_cases(cfg):
@@ -141,13 +225,13 @@ def run(cfg,global_cfg,out_dir):
 
     # Runtime environment is identical for every branch and fault case.
     sun,sun_pos,states,eclipse_state,illum,B_i,orbit_meta=_make_environment(t,base,global_cfg)
-    runtime_context=build_orbital_context(states,sun,B_i,illum); runtime_baseline=build_physics_baseline(states,sun,B_i,dt,str(base.get('pointing_axis','x')))
+    model_cfg=copy.deepcopy(cfg.get('models',{})); dataset_cfg=copy.deepcopy(model_cfg.get('dataset',{})); dataset_cfg.setdefault('dt_s',dt); dataset_cfg.setdefault('window',int(model_cfg.get('window',20)))
+    runtime_context,runtime_baseline,runtime_orbit_knowledge=_runtime_mission_context(t,base,global_cfg,dataset_cfg,sun,sun_pos,states,B_i,illum)
     axis=str(base.get('pointing_axis','x')); q0=sun_pointing_initial_quaternion(axis,sun[0],float(base.get('initial_error_deg',30.))); omega0=np.asarray(base.get('omega0_rad_s',[0,0,0]),float)
     sc=global_cfg['sensors']; seed=int(cfg.get('seed',99501)); rng=np.random.default_rng(seed)
     noise={'gyro':rng.normal(0,float(sc['gyro_noise_std_rad_s']),(n,3)),'sun':rng.normal(0,float(sc['vector_noise_std']),(n,3)),'mag':rng.normal(0,float(sc['vector_noise_std']),(n,3))}
 
     # One shared dataset for every architecture and variant.
-    model_cfg=copy.deepcopy(cfg.get('models',{})); dataset_cfg=copy.deepcopy(model_cfg.get('dataset',{})); dataset_cfg.setdefault('dt_s',dt); dataset_cfg.setdefault('window',int(model_cfg.get('window',20)))
     dataset=generate_shared_dataset(dataset_cfg,gyro_noise_std=float(sc['gyro_noise_std_rad_s']),vector_noise_std=float(sc['vector_noise_std']))
     save_shared_dataset(dataset,models_dir/'shared_dataset',save_npz=bool(model_cfg.get('save_shared_dataset_npz',False)))
     # Flatten training config expected by model matrix helper.
@@ -155,11 +239,17 @@ def run(cfg,global_cfg,out_dir):
                 'training':model_cfg.get('training',{}),'hyperparameters':model_cfg.get('hyperparameters',{})}
     bundles,model_validation=train_fair_model_matrix(dataset,models_dir/'fair_matrix',matrix_cfg)
     _save_table(model_validation,tables/'model_validation_test_resources')
+    sweep_df=_evaluate_orbit_uncertainty_sweep(
+        bundles,dataset_cfg,model_cfg.get('orbit_uncertainty_sweep',{}),
+        float(sc['gyro_noise_std_rad_s']),float(sc['vector_noise_std'])
+    )
+    if not sweep_df.empty:
+        _save_table(sweep_df,tables/'orbit_uncertainty_sweep')
 
     specs=_branch_specs(cfg); summary_rows=[]; ts_rows=[]; sunlight_min=float(cfg.get('metrics',{}).get('sunlight_min_illumination',.05)); rec_thr=float(cfg.get('metrics',{}).get('recovery_threshold_deg',2.0)); rec_hold=float(cfg.get('metrics',{}).get('recovery_hold_s',10.0))
     fdir_cfg=copy.deepcopy(cfg.get('fdir',{})); fdir_mode=str(fdir_cfg.get('mode','classical_v2')).lower()
-    if fdir_mode not in ('oracle','classical','classical_v2'):
-        raise ValueError(f'Unsupported FDIR mode: {fdir_mode}. Use oracle, classical, or classical_v2.')
+    if fdir_mode not in ('oracle','classical','classical_v2','classical_v3','classical_v31'):
+        raise ValueError(f'Unsupported FDIR mode: {fdir_mode}. Use oracle, classical_v2, classical_v3, or classical_v31.')
     formats=tuple(global_cfg['visualization']['formats']); dpi=int(global_cfg['visualization']['dpi']); palette=[PALETTE['green_3'],PALETTE['red_strong'],PALETTE['neutral_dark'],PALETTE['blue_main'],PALETTE['violet'],PALETTE['teal']]
     animation_cfg=cfg.get('animation',{}); animation_enabled=bool(animation_cfg.get('enabled',False)); animation_cases={str(x).lower() for x in animation_cfg.get('cases',[])}
 
@@ -197,7 +287,7 @@ def run(cfg,global_cfg,out_dir):
             det_masks={'gyro':np.asarray(r['fdir_detected_gyro'],bool),'sun':np.asarray(r['fdir_detected_sun'],bool),'mag':np.asarray(r['fdir_detected_mag'],bool)}
             confs={'gyro':np.asarray(r['fdir_conf_gyro'],float),'sun':np.asarray(r['fdir_conf_sun'],float),'mag':np.asarray(r['fdir_conf_mag'],float)}
             armed=np.asarray(r['fdir_armed'],bool)
-            detector_active=bool(fdir_mode in ('classical','classical_v2') and branch not in ('healthy_mekf','faulty_mekf'))
+            detector_active=bool(fdir_mode in ('classical','classical_v2','classical_v3','classical_v31') and branch not in ('healthy_mekf','faulty_mekf'))
             for sensor in ('gyro','sun','mag'):
                 gt=truth_masks[sensor]; detm=det_masks[sensor]
                 eval_mask=armed & (sunlight if sensor=='sun' else np.ones(n,bool))
@@ -228,6 +318,12 @@ def run(cfg,global_cfg,out_dir):
                 'fdir_gyro_rate_residual_rad_s':r['fdir_gyro_rate_residual'],'fdir_gyro_vector_rate_residual_rad_s':r['fdir_gyro_vector_rate_residual'],'fdir_gyro_cross_sensor_deg':r['fdir_gyro_cross_sensor'],'fdir_sun_innovation_deg':r['fdir_sun_innovation'],'fdir_mag_innovation_deg':r['fdir_mag_innovation'],
                 'fdir_sun_mag_geometry_error_deg':r['fdir_geometry_error'],'fdir_sun_gyro_track_error_deg':r['fdir_sun_track_error'],'fdir_mag_gyro_track_error_deg':r['fdir_mag_track_error'],
                 'fdir_gyro_hard_unavailable':r['fdir_hard_gyro'].astype(int),'fdir_sun_hard_unavailable':r['fdir_hard_sun'].astype(int),'fdir_mag_hard_unavailable':r['fdir_hard_mag'].astype(int),'fdir_sun_expected_unavailable':r['fdir_sun_expected_unavailable'].astype(int),
+                'fdir_gyro_soft_ewma':r['fdir_gyro_soft_ewma'],'fdir_sun_soft_ewma':r['fdir_sun_soft_ewma'],'fdir_mag_soft_ewma':r['fdir_mag_soft_ewma'],
+                'fdir_gyro_soft_cusum':r['fdir_gyro_soft_cusum'],'fdir_sun_soft_cusum':r['fdir_sun_soft_cusum'],'fdir_mag_soft_cusum':r['fdir_mag_soft_cusum'],
+                'fdir_gyro_soft_quality':r['fdir_gyro_soft_quality'],'fdir_sun_soft_quality':r['fdir_sun_soft_quality'],'fdir_mag_soft_quality':r['fdir_mag_soft_quality'],
+                'fdir_gyro_soft_evidence':r['fdir_gyro_soft_evidence'],'fdir_sun_soft_evidence':r['fdir_sun_soft_evidence'],'fdir_mag_soft_evidence':r['fdir_mag_soft_evidence'],
+                'fdir_gyro_soft_gate_active':r['fdir_gyro_soft_gate'].astype(int),'fdir_sun_soft_gate_active':r['fdir_sun_soft_gate'].astype(int),'fdir_mag_soft_gate_active':r['fdir_mag_soft_gate'].astype(int),
+                'fdir_gyro_cross_evidence_valid':r['fdir_gyro_cross_evidence_valid'].astype(int),'fdir_gyro_vector_rate_evidence_valid':r['fdir_gyro_vector_rate_evidence_valid'].astype(int),
                 'truth_gyro_fault':r['gyro_faulted'].astype(int),'truth_sun_fault':r['sensor_faulted'].astype(int),'truth_mag_fault':r['mag_faulted'].astype(int)}))
 
         # Per-case plot of primary pointing trajectories. Keep publication plots even when animation is disabled.
