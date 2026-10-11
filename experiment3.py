@@ -10,6 +10,10 @@ import copy
 import json
 import math
 import traceback
+import time
+import threading
+import sys
+from contextlib import redirect_stdout, redirect_stderr
 from datetime import datetime, timezone
 from pathlib import Path
 import tomllib
@@ -142,12 +146,50 @@ def plots(result_dir):
             for y in ['macro_f1_pct','mean_false_alarm_rate_pct','mean_detection_delay_s','macro_recall_pct']:
                 _fig(df,y,f'Experiment 2 · {y}',result_dir/'figures'/f'exp2_{y}')
 
+class Tee:
+    """Mirror experiment stdout/stderr to console and a persistent log file."""
+    def __init__(self, terminal, logfile):
+        self.terminal=terminal
+        self.logfile=logfile
+    def write(self, value):
+        self.terminal.write(value)
+        self.logfile.write(value)
+        self.logfile.flush()
+    def flush(self):
+        self.terminal.flush()
+        self.logfile.flush()
+    def isatty(self):
+        return self.terminal.isatty()
+
+
+def fmt_seconds(seconds):
+    seconds=int(max(0, seconds))
+    hours, remainder=divmod(seconds,3600)
+    minutes, seconds=divmod(remainder,60)
+    return f'{hours:02d}:{minutes:02d}:{seconds:02d}'
+
+
+def progress_line(completed,total,started,case,experiment,elapsed_case,successful,failed):
+    pct=100*completed/total if total else 100.0
+    width=24
+    filled=round(width*completed/total) if total else width
+    bar='█'*filled+'░'*(width-filled)
+    elapsed=time.monotonic()-started
+    eta=elapsed/completed*(total-completed) if completed else None
+    eta_text=fmt_seconds(eta) if eta is not None else 'calculating'
+    return (f'[CAMPAIGN] [{bar}] {completed}/{total} ({pct:.1f}%) | '
+            f'elapsed {fmt_seconds(elapsed)} | ETA {eta_text} | '
+            f'OK {successful}, failed {failed} | current exp{experiment}/{case} '
+            f'({fmt_seconds(elapsed_case)})')
+
+
 def run():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--dry-run',action='store_true');ap.add_argument('--limit',type=int)
     ap.add_argument('--experiment',choices=['1','2','both'],default='both')
     ap.add_argument('--results',default='results/experiment3');ap.add_argument('--resume',action='store_true')
     ap.add_argument('--dt',type=float,default=.1);ap.add_argument('--plots-only',action='store_true')
+    ap.add_argument('--heartbeat',type=float,default=30.0,help='Seconds between progress updates (default: 30; 0 disables)')
     a=ap.parse_args(); out=ROOT/a.results;out.mkdir(parents=True,exist_ok=True)
     if a.plots_only: plots(out);return
     if not (0<a.dt<=10):raise ValueError('--dt must be >0 and <=10 seconds')
@@ -159,32 +201,80 @@ def run():
         print(f'Manifest created: {len(man)} configurations, two full orbits each; {out}');return
     exps=[1,2] if a.experiment=='both' else [int(a.experiment)]
     selected=man.iloc[:a.limit] if a.limit is not None else man
+    if a.heartbeat < 0:
+        raise ValueError('--heartbeat must be >= 0')
+    tasks=[(index,row,exp) for index,row in selected.iterrows() for exp in exps]
+    total=len(tasks)
+    started=time.monotonic()
     log=[]
-    for index,row in selected.iterrows():
-        for exp in exps:
-            folder=out/'runs'/f'exp{exp}'/row.case_id
-            expected=folder/('reaction_wheel_fair_ml_campaign_summary.csv' if exp==1 else 'reaction_wheel_ml_fdir_campaign_summary.csv')
-            try:
-                if not (a.resume and expected.exists()):
+    with (out/'campaign.log').open('a',encoding='utf-8',buffering=1) as lf:
+        with redirect_stdout(Tee(sys.stdout,lf)),redirect_stderr(Tee(sys.stderr,lf)):
+            print(f'\n=== Experiment 3 started {datetime.now().astimezone().isoformat(timespec="seconds")} ===',flush=True)
+            print(f'Cases: {len(selected)} | Experiments: {exps} | Runs: {total} | dt: {a.dt}s | heartbeat: {a.heartbeat}s',flush=True)
+            print(f'Logging to {out / "campaign.log"}',flush=True)
+            for task_number,(index,row,exp) in enumerate(tasks,1):
+                folder=out/'runs'/f'exp{exp}'/row.case_id
+                expected=folder/('reaction_wheel_fair_ml_campaign_summary.csv' if exp==1 else 'reaction_wheel_ml_fdir_campaign_summary.csv')
+                case_started=time.monotonic()
+                stop=threading.Event()
+                completed=task_number-1
+                ok=sum(x['status'] in ('ok','skipped') for x in log)
+                failed=sum(x['status']=='failed' for x in log)
+                print('\n'+'='*72,flush=True)
+                print(f'[START {task_number}/{total}] exp{exp} | {row.case_id} | '
+                      f'inclination={row.inclination_deg:g}° mass={row.mass_kg:g}kg form={row.form_factor} | '
+                      f'2 orbits={row.duration_s/60:.1f} simulated minutes | '
+                      f'wall time {datetime.now().astimezone().isoformat(timespec="seconds")}',flush=True)
+                def heartbeat():
+                    while not stop.wait(a.heartbeat):
+                        print(progress_line(completed,total,started,row.case_id,exp,
+                                            time.monotonic()-case_started,ok,failed),flush=True)
+                watcher=None
+                if a.heartbeat>0:
+                    watcher=threading.Thread(target=heartbeat,name='experiment3-progress',daemon=True)
+                    watcher.start()
+                status='ok'
+                error=''
+                try:
+                    if a.resume and expected.exists():
+                        print(f'[RESUME] Existing output detected: {expected}; validating summary.',flush=True)
+                        status='skipped'
+                    else:
+                        folder.mkdir(parents=True,exist_ok=True)
+                        cfg,ec=_set_config(base_cfg,row,exp,99501)
+                        (folder/'case_config.json').write_text(json.dumps({'orbit':cfg['orbit'],'spacecraft':cfg['scenarios']['reaction_wheel_sun_pointing_comparison']['spacecraft'],'experiment_config':ec},indent=2,default=str))
+                        print('[RUNNING] Calling original experiment code. Its own messages appear below.',flush=True)
+                        if exp==1: experiment1.run(ec,cfg,folder)
+                        else: experiment2.run(ec,cfg,folder)
+                    summary=_collect_exp1(folder,row) if exp==1 else _collect_exp2(folder,row)
+                    summary.to_csv(folder/'exp3_normalized.csv',index=False)
+                except Exception as err:
+                    status='failed'
+                    error=repr(err)
                     folder.mkdir(parents=True,exist_ok=True)
-                    cfg,ec=_set_config(base_cfg,row,exp,99501)
-                    (folder/'case_config.json').write_text(json.dumps({'orbit':cfg['orbit'],'spacecraft':cfg['scenarios']['reaction_wheel_sun_pointing_comparison']['spacecraft'],'experiment_config':ec},indent=2,default=str))
-                    print(f'[{index+1}/{len(selected)}] Experiment {exp}: {row.case_id}',flush=True)
-                    if exp==1:experiment1.run(ec,cfg,folder)
-                    else:experiment2.run(ec,cfg,folder)
-                summary=_collect_exp1(folder,row) if exp==1 else _collect_exp2(folder,row)
-                summary.to_csv(folder/'exp3_normalized.csv',index=False)
-                log.append({'experiment':exp,'case_id':row.case_id,'status':'ok'})
-            except Exception as err:
-                log.append({'experiment':exp,'case_id':row.case_id,'status':'failed','error':repr(err)})
-                (folder/'failure.txt').write_text(traceback.format_exc())
-                print(f'ERROR {row.case_id} exp{exp}: {err}',flush=True)
-            finally:
-                pd.DataFrame(log).to_csv(out/'status.csv',index=False)
-                for e in exps:
-                    parts=list((out/'runs'/f'exp{e}').glob('*/exp3_normalized.csv'))
-                    if parts:pd.concat([pd.read_csv(p) for p in parts],ignore_index=True).to_csv(out/f'experiment{e}.csv',index=False)
-                plots(out)
+                    (folder/'failure.txt').write_text(traceback.format_exc(),encoding='utf-8')
+                    print(f'[ERROR] {row.case_id} exp{exp}: {err}',flush=True)
+                    traceback.print_exc()
+                finally:
+                    stop.set()
+                    if watcher: watcher.join(timeout=1.0)
+                    elapsed_case=time.monotonic()-case_started
+                    log.append({'experiment':exp,'case_id':row.case_id,'status':status,
+                                'wall_time_s':round(elapsed_case,3),'error':error})
+                    print(f'[END {task_number}/{total}] status={status.upper()} | duration={fmt_seconds(elapsed_case)}',flush=True)
+                    pd.DataFrame(log).to_csv(out/'status.csv',index=False)
+                    for e in exps:
+                        parts=list((out/'runs'/f'exp{e}').glob('*/exp3_normalized.csv'))
+                        if parts:
+                            pd.concat([pd.read_csv(q) for q in parts],ignore_index=True).to_csv(out/f'experiment{e}.csv',index=False)
+                    try:
+                        plots(out)
+                    except Exception as plot_error:
+                        print(f'[PLOT WARNING] {plot_error}',flush=True)
+                    print(progress_line(task_number,total,started,row.case_id,exp,elapsed_case,
+                                        sum(x['status'] in ('ok','skipped') for x in log),
+                                        sum(x['status']=='failed' for x in log)),flush=True)
+            print(f'Campaign wall time: {fmt_seconds(time.monotonic()-started)}',flush=True)
     print(f'Finished. Results: {out}. Failed runs: {sum(x["status"]=="failed" for x in log)}')
 
 if __name__=='__main__':run()
