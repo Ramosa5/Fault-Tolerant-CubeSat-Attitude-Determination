@@ -18,7 +18,7 @@ from src.scenarios.registry import SCENARIOS
 def test_ml_fdir_scenario_registered_and_active():
     root = Path(__file__).resolve().parents[1]
     cfg = tomllib.loads((root / 'experiment_config.toml').read_text())
-    assert cfg['scenario']['active'] == 'reaction_wheel_ml_fdir_campaign'
+    assert cfg['scenario']['active'] in {'reaction_wheel_ml_fdir_campaign','thesis_results_campaign'}
     assert 'reaction_wheel_ml_fdir_campaign' in SCENARIOS
     sc = cfg['scenarios']['reaction_wheel_ml_fdir_campaign']
     assert sc['models']['architectures'] == ['mlp', 'cnn', 'gru']
@@ -165,7 +165,7 @@ def test_severity_sweeps_have_common_match_groups():
     assert len({c['match_group'] for c in mis})==1
 
 
-def test_heterogeneous_hybrid_selection_uses_validation_f1_and_can_keep_classical():
+def test_heterogeneous_hybrid_selection_requires_run_level_stability():
     rows=[]
     for arch,vals in {
         'mlp': {'gyro':(42.,40.), 'sun':(31.0,31.0), 'mag':(35.,34.)},
@@ -182,13 +182,104 @@ def test_heterogeneous_hybrid_selection_uses_validation_f1_and_can_keep_classica
                 'classical_baseline_f1_pct':base,
                 'classical_baseline_far_pct':.5,'feasible':True,
             })
-    sel=_select_validation_heterogeneous_hybrid(pd.DataFrame(rows),min_f1_gain_pct=.25)
+    cal=pd.DataFrame(rows)
+
+    stability=[]
+    for arch in ('mlp','cnn','gru'):
+        for sensor in ('gyro','sun','mag'):
+            # Three positive-fault validation runs plus one healthy/negative run.
+            gains = {
+                ('cnn','gyro'):[5.,4.,3.],
+                ('cnn','mag'):[6.,5.,4.],
+                ('gru','gyro'):[3.,2.,2.],
+                ('gru','mag'):[4.,3.,2.],
+                ('mlp','gyro'):[2.,1.,1.],
+                ('mlp','mag'):[1.,1.,0.5],
+            }.get((arch,sensor), [0.1,0.0,-0.1])
+            for rid,gain in enumerate(gains):
+                stability.append({
+                    'architecture':arch,'sensor':sensor,'run_id':rid,
+                    'fault_family':'soft','threshold':.7,'has_positive_fault':True,
+                    'positive_samples':100,'negative_samples':100,
+                    'classical_precision_pct':50.,'classical_recall_pct':40.,
+                    'classical_f1_pct':40.,'classical_far_pct':.5,
+                    'hybrid_precision_pct':55.,'hybrid_recall_pct':45.,
+                    'hybrid_f1_pct':40.+gain,'hybrid_far_pct':.8,
+                    'f1_gain_pct':gain,'far_increment_pct':.3,
+                })
+            stability.append({
+                'architecture':arch,'sensor':sensor,'run_id':99,
+                'fault_family':'healthy','threshold':.7,'has_positive_fault':False,
+                'positive_samples':0,'negative_samples':200,
+                'classical_precision_pct':np.nan,'classical_recall_pct':np.nan,
+                'classical_f1_pct':np.nan,'classical_far_pct':0.,
+                'hybrid_precision_pct':np.nan,'hybrid_recall_pct':np.nan,
+                'hybrid_f1_pct':np.nan,'hybrid_far_pct':.4,
+                'f1_gain_pct':np.nan,'far_increment_pct':.4,
+            })
+
+    sel=_select_validation_heterogeneous_hybrid(
+        cal,pd.DataFrame(stability),min_f1_gain_pct=.25,
+        min_positive_run_improvement_fraction=.60,
+        min_positive_run_nondegradation_fraction=.75,
+        f1_degradation_tolerance_pct=.25,
+        max_per_run_incremental_far_pct=2.0,
+        max_p95_incremental_far_pct=1.0,
+    )
     mapping=dict(zip(sel.sensor,sel.selected_architecture))
     assert mapping['gyro']=='cnn'
     assert mapping['mag']=='cnn'
-    # Best Sun gain is only 0.2 percentage points, below the configured 0.25 pp.
     assert mapping['sun']=='classical_only'
 
+
+def test_heterogeneous_selector_rejects_aggregate_winner_with_one_far_spike():
+    cal=pd.DataFrame([{
+        'architecture':'cnn','sensor':'gyro','mode':'hybrid_augmentation',
+        'threshold':.7,'precision_pct':80.,'recall_pct':50.,'f1_pct':60.,
+        'false_alarm_rate_pct':.9,'far_limit_pct':1.0,
+        'classical_baseline_precision_pct':75.,
+        'classical_baseline_recall_pct':40.,
+        'classical_baseline_f1_pct':50.,
+        'classical_baseline_far_pct':.5,'feasible':True,
+    }])
+    st=[]
+    for rid,far_inc in enumerate([.1,.2,15.0]):
+        st.append({
+            'architecture':'cnn','sensor':'gyro','run_id':rid,'fault_family':'gyro_bias',
+            'threshold':.7,'has_positive_fault':True,'positive_samples':100,'negative_samples':100,
+            'classical_precision_pct':75.,'classical_recall_pct':40.,
+            'classical_f1_pct':50.,'classical_far_pct':.5,
+            'hybrid_precision_pct':80.,'hybrid_recall_pct':50.,
+            'hybrid_f1_pct':60.,'hybrid_far_pct':.5+far_inc,
+            'f1_gain_pct':10.,'far_increment_pct':far_inc,
+        })
+    # Provide harmless rows for the other sensors so the helper can complete.
+    for sensor in ('sun','mag'):
+        cal.loc[len(cal)] = {
+            'architecture':'cnn','sensor':sensor,'mode':'hybrid_augmentation',
+            'threshold':.7,'precision_pct':50.,'recall_pct':50.,'f1_pct':50.,
+            'false_alarm_rate_pct':.5,'far_limit_pct':1.0,
+            'classical_baseline_precision_pct':50.,
+            'classical_baseline_recall_pct':50.,
+            'classical_baseline_f1_pct':50.,
+            'classical_baseline_far_pct':.5,'feasible':True,
+        }
+        st.append({
+            'architecture':'cnn','sensor':sensor,'run_id':10,'fault_family':'soft',
+            'threshold':.7,'has_positive_fault':True,'positive_samples':100,'negative_samples':100,
+            'classical_precision_pct':50.,'classical_recall_pct':50.,
+            'classical_f1_pct':50.,'classical_far_pct':.5,
+            'hybrid_precision_pct':50.,'hybrid_recall_pct':50.,
+            'hybrid_f1_pct':50.,'hybrid_far_pct':.5,
+            'f1_gain_pct':0.,'far_increment_pct':0.,
+        })
+    sel=_select_validation_heterogeneous_hybrid(
+        cal,pd.DataFrame(st),min_f1_gain_pct=.25,
+        max_per_run_incremental_far_pct=2.0,max_p95_incremental_far_pct=1.0,
+    )
+    gyro=sel[sel.sensor=='gyro'].iloc[0]
+    assert gyro.selected_architecture=='classical_only'
+    assert gyro.selection_reason=='classical_retained_run_level_stability_failed'
 
 def test_experiment2_final_config_enables_validation_selected_hybrid():
     root=Path(__file__).resolve().parents[1]
@@ -196,6 +287,11 @@ def test_experiment2_final_config_enables_validation_selected_hybrid():
     m=cfg['scenarios']['reaction_wheel_ml_fdir_campaign']['models']
     assert m['heterogeneous_hybrid_enabled'] is True
     assert m['heterogeneous_min_validation_f1_gain_pct'] > 0.0
+    assert m['heterogeneous_min_positive_run_improvement_fraction'] >= .5
+    assert m['heterogeneous_max_per_run_incremental_far_pct'] <= 2.0
+    ev=cfg['scenarios']['reaction_wheel_ml_fdir_campaign']['evaluation']
+    assert ev['seed'] == 17011
+    assert ev['repeats'] >= 6
 
 
 def test_mag_loss_does_not_poison_bdot_controller_with_nan():

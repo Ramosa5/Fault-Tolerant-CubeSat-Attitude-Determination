@@ -455,59 +455,271 @@ def _threshold_records_for_bundle(bundle, sequences: dict[int, dict], run_ids: l
 
 
 
-def _select_validation_heterogeneous_hybrid(calibration_df: pd.DataFrame,
-                                            min_f1_gain_pct: float = 0.25) -> pd.DataFrame:
-    """Select one validation-approved ML architecture per sensor.
+def _binary_validation_metrics(y: np.ndarray, detected: np.ndarray,
+                               eval_mask: np.ndarray) -> dict:
+    """Binary metrics for one sensor on one complete validation trajectory."""
+    m = np.asarray(eval_mask, bool)
+    yy = np.asarray(y, bool)
+    pp = np.asarray(detected, bool)
+    tp = int(np.sum(m & yy & pp))
+    fp = int(np.sum(m & ~yy & pp))
+    fn = int(np.sum(m & yy & ~pp))
+    tn = int(np.sum(m & ~yy & ~pp))
+    has_positive = bool(tp + fn > 0)
+    precision = tp / (tp + fp) if tp + fp else (0.0 if has_positive else np.nan)
+    recall = tp / (tp + fn) if has_positive else np.nan
+    f1 = (
+        2.0 * precision * recall / (precision + recall)
+        if has_positive and np.isfinite(precision) and precision + recall > 0 else
+        (0.0 if has_positive else np.nan)
+    )
+    far = fp / (fp + tn) if fp + tn else 0.0
+    return {
+        "has_positive_fault": has_positive,
+        "positive_samples": int(tp + fn),
+        "negative_samples": int(fp + tn),
+        "precision_pct": 100.0 * precision if np.isfinite(precision) else np.nan,
+        "recall_pct": 100.0 * recall if np.isfinite(recall) else np.nan,
+        "f1_pct": 100.0 * f1 if np.isfinite(f1) else np.nan,
+        "far_pct": 100.0 * far,
+        "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+    }
 
-    Selection uses ONLY hybrid threshold-calibration results from complete validation
-    sequences. ``classical_only`` is an explicit candidate and is retained whenever
-    no ML architecture improves validation F1 by at least ``min_f1_gain_pct``.
-    This prevents test-set model selection and allows different sensors to use
-    different lightweight architectures.
+
+def _build_validation_stability_table(
+    bundles: dict,
+    validation_records_by_arch: dict[str, list[dict]],
+    run_family_lookup: dict[int, str],
+    *,
+    alpha: float,
+    persistence_samples: int,
+    reset_samples: int,
+) -> pd.DataFrame:
+    """Score each frozen hybrid candidate on each complete validation trajectory.
+
+    This table is deliberately run-level. It detects candidates whose aggregate
+    validation FAR looks acceptable only because a few trajectories with very high
+    false-alarm rates are diluted by many quiet trajectories.
+    """
+    rows = []
+    for arch, bundle in bundles.items():
+        records = validation_records_by_arch[str(arch)]
+        thresholds = np.asarray(bundle.hybrid_thresholds, float)
+        for rec in records:
+            _, ml_aug = apply_probability_filter(
+                rec["probabilities"], thresholds,
+                alpha=alpha,
+                persistence_samples=persistence_samples,
+                reset_samples=reset_samples,
+                active_mask=rec["eval_mask"],
+            )
+            classical = np.asarray(rec["classical"], bool)
+            hybrid = classical | ml_aug
+            truth = np.asarray(rec["truth"], bool)
+            mask = np.asarray(rec["eval_mask"], bool)
+            rid = int(rec["run_id"])
+            for j, sensor in enumerate(SENSORS):
+                b = _binary_validation_metrics(truth[:, j], classical[:, j], mask[:, j])
+                h = _binary_validation_metrics(truth[:, j], hybrid[:, j], mask[:, j])
+                rows.append({
+                    "architecture": str(arch),
+                    "sensor": sensor,
+                    "run_id": rid,
+                    "fault_family": str(run_family_lookup.get(rid, "unknown")),
+                    "threshold": float(thresholds[j]),
+                    "has_positive_fault": bool(h["has_positive_fault"]),
+                    "positive_samples": int(h["positive_samples"]),
+                    "negative_samples": int(h["negative_samples"]),
+                    "classical_precision_pct": b["precision_pct"],
+                    "classical_recall_pct": b["recall_pct"],
+                    "classical_f1_pct": b["f1_pct"],
+                    "classical_far_pct": b["far_pct"],
+                    "hybrid_precision_pct": h["precision_pct"],
+                    "hybrid_recall_pct": h["recall_pct"],
+                    "hybrid_f1_pct": h["f1_pct"],
+                    "hybrid_far_pct": h["far_pct"],
+                    "f1_gain_pct": (
+                        float(h["f1_pct"] - b["f1_pct"])
+                        if h["has_positive_fault"] else np.nan
+                    ),
+                    "far_increment_pct": float(h["far_pct"] - b["far_pct"]),
+                })
+    return pd.DataFrame(rows)
+
+
+def _select_validation_heterogeneous_hybrid(
+    calibration_df: pd.DataFrame,
+    stability_df: pd.DataFrame,
+    *,
+    min_f1_gain_pct: float = 0.25,
+    min_positive_run_improvement_fraction: float = 0.60,
+    min_positive_run_nondegradation_fraction: float = 0.75,
+    f1_degradation_tolerance_pct: float = 0.25,
+    max_per_run_incremental_far_pct: float = 2.0,
+    max_p95_incremental_far_pct: float = 1.0,
+) -> pd.DataFrame:
+    """Select one robust validation-approved architecture per sensor.
+
+    A model must first satisfy the aggregate validation FAR-constrained threshold
+    calibration. It must then generalize across the *individual validation runs*:
+
+    - sufficient aggregate F1 gain over classical FDIR,
+    - positive F1 gain on a configurable fraction of positive-fault runs,
+    - no meaningful F1 degradation on most positive-fault runs,
+    - bounded worst-case and 95th-percentile run-level incremental FAR.
+
+    ``classical_only`` remains an explicit safe candidate. Held-out evaluation/test
+    trajectories are never consulted by this selector.
     """
     df = calibration_df.copy()
     df = df[df["mode"] == "hybrid_augmentation"].copy()
     rows = []
+
     for sensor in SENSORS:
         q = df[(df["sensor"] == sensor) & (df["feasible"].astype(bool))].copy()
         if q.empty:
             rows.append({
-                "sensor": sensor, "selected_architecture": "classical_only",
-                "selected_threshold": 1.01, "validation_precision_pct": np.nan,
-                "validation_recall_pct": np.nan, "validation_f1_pct": np.nan,
-                "validation_far_pct": np.nan, "classical_baseline_f1_pct": np.nan,
-                "classical_baseline_far_pct": np.nan, "validation_f1_gain_pct": 0.0,
-                "validation_far_increment_pct": 0.0, "selection_reason": "no_feasible_ml_candidate",
+                "sensor": sensor,
+                "selected_architecture": "classical_only",
+                "selected_threshold": 1.01,
+                "validation_precision_pct": np.nan,
+                "validation_recall_pct": np.nan,
+                "validation_f1_pct": np.nan,
+                "validation_far_pct": np.nan,
+                "classical_baseline_f1_pct": np.nan,
+                "classical_baseline_far_pct": np.nan,
+                "validation_f1_gain_pct": 0.0,
+                "validation_far_increment_pct": 0.0,
+                "positive_validation_runs": 0,
+                "positive_run_improvement_fraction": 0.0,
+                "positive_run_nondegradation_fraction": 0.0,
+                "median_positive_run_f1_gain_pct": np.nan,
+                "p95_run_incremental_far_pct": np.nan,
+                "max_run_incremental_far_pct": np.nan,
+                "robust_candidate": False,
+                "selection_reason": "no_feasible_ml_candidate",
             })
             continue
 
         base_f1 = float(q["classical_baseline_f1_pct"].dropna().iloc[0])
         base_far = float(q["classical_baseline_far_pct"].dropna().iloc[0])
-        # Prefer validation F1, then recall, precision, lower FAR and finally fewer
-        # parameters indirectly via deterministic architecture name ordering.
-        q = q.sort_values(
-            ["f1_pct", "recall_pct", "precision_pct", "false_alarm_rate_pct", "architecture"],
-            ascending=[False, False, False, True, True],
+
+        candidate_rows = []
+        for _, cand in q.iterrows():
+            arch = str(cand["architecture"])
+            st = stability_df[
+                (stability_df["sensor"] == sensor) &
+                (stability_df["architecture"] == arch)
+            ].copy()
+            pos = st[st["has_positive_fault"].astype(bool)].copy()
+
+            gains = pos["f1_gain_pct"].dropna().to_numpy(float)
+            far_inc = st["far_increment_pct"].fillna(0.0).to_numpy(float)
+            positive_runs = int(len(gains))
+            improve_fraction = float(np.mean(gains > 0.0)) if positive_runs else 0.0
+            nondegrade_fraction = (
+                float(np.mean(gains >= -float(f1_degradation_tolerance_pct)))
+                if positive_runs else 0.0
+            )
+            median_gain = float(np.median(gains)) if positive_runs else np.nan
+            p95_far_inc = float(np.percentile(far_inc, 95)) if len(far_inc) else np.nan
+            max_far_inc = float(np.max(far_inc)) if len(far_inc) else np.nan
+            aggregate_gain = float(cand["f1_pct"] - base_f1)
+
+            robust = bool(
+                positive_runs > 0
+                and aggregate_gain >= float(min_f1_gain_pct)
+                and improve_fraction >= float(min_positive_run_improvement_fraction)
+                and nondegrade_fraction >= float(min_positive_run_nondegradation_fraction)
+                and max_far_inc <= float(max_per_run_incremental_far_pct) + 1e-12
+                and p95_far_inc <= float(max_p95_incremental_far_pct) + 1e-12
+            )
+
+            candidate_rows.append({
+                "architecture": arch,
+                "threshold": float(cand["threshold"]),
+                "precision_pct": float(cand["precision_pct"]),
+                "recall_pct": float(cand["recall_pct"]),
+                "f1_pct": float(cand["f1_pct"]),
+                "far_pct": float(cand["false_alarm_rate_pct"]),
+                "aggregate_gain_pct": aggregate_gain,
+                "far_increment_pct": float(cand["false_alarm_rate_pct"] - base_far),
+                "positive_runs": positive_runs,
+                "improve_fraction": improve_fraction,
+                "nondegrade_fraction": nondegrade_fraction,
+                "median_gain_pct": median_gain,
+                "p95_far_increment_pct": p95_far_inc,
+                "max_far_increment_pct": max_far_inc,
+                "robust": robust,
+            })
+
+        cq = pd.DataFrame(candidate_rows)
+        robust_q = cq[cq["robust"]].copy()
+
+        if robust_q.empty:
+            # Preserve the classical detector if no architecture is consistently
+            # beneficial across validation trajectories.
+            best_rejected = cq.sort_values(
+                ["aggregate_gain_pct", "improve_fraction", "nondegrade_fraction",
+                 "p95_far_increment_pct", "max_far_increment_pct"],
+                ascending=[False, False, False, True, True],
+                kind="stable",
+            ).iloc[0]
+            rows.append({
+                "sensor": sensor,
+                "selected_architecture": "classical_only",
+                "selected_threshold": 1.01,
+                "validation_precision_pct": float(best_rejected.get("precision_pct", np.nan)),
+                "validation_recall_pct": float(best_rejected.get("recall_pct", np.nan)),
+                "validation_f1_pct": base_f1,
+                "validation_far_pct": base_far,
+                "classical_baseline_f1_pct": base_f1,
+                "classical_baseline_far_pct": base_far,
+                "validation_f1_gain_pct": 0.0,
+                "validation_far_increment_pct": 0.0,
+                "positive_validation_runs": int(best_rejected["positive_runs"]),
+                "positive_run_improvement_fraction": float(best_rejected["improve_fraction"]),
+                "positive_run_nondegradation_fraction": float(best_rejected["nondegrade_fraction"]),
+                "median_positive_run_f1_gain_pct": float(best_rejected["median_gain_pct"]),
+                "p95_run_incremental_far_pct": float(best_rejected["p95_far_increment_pct"]),
+                "max_run_incremental_far_pct": float(best_rejected["max_far_increment_pct"]),
+                "robust_candidate": False,
+                "best_rejected_architecture": str(best_rejected["architecture"]),
+                "selection_reason": "classical_retained_run_level_stability_failed",
+            })
+            continue
+
+        # Rank only candidates that passed every pre-declared robustness condition.
+        robust_q = robust_q.sort_values(
+            ["f1_pct", "improve_fraction", "nondegrade_fraction",
+             "median_gain_pct", "p95_far_increment_pct", "far_pct", "architecture"],
+            ascending=[False, False, False, False, True, True, True],
             kind="stable",
         )
-        best = q.iloc[0]
-        gain = float(best["f1_pct"] - base_f1)
-        far_inc = float(best["false_alarm_rate_pct"] - base_far)
-        selected = str(best["architecture"]) if gain >= float(min_f1_gain_pct) else "classical_only"
+        best = robust_q.iloc[0]
         rows.append({
             "sensor": sensor,
-            "selected_architecture": selected,
-            "selected_threshold": float(best["threshold"]) if selected != "classical_only" else 1.01,
-            "validation_precision_pct": float(best["precision_pct"]) if selected != "classical_only" else float(best["classical_baseline_precision_pct"]),
-            "validation_recall_pct": float(best["recall_pct"]) if selected != "classical_only" else float(best["classical_baseline_recall_pct"]),
-            "validation_f1_pct": float(best["f1_pct"]) if selected != "classical_only" else base_f1,
-            "validation_far_pct": float(best["false_alarm_rate_pct"]) if selected != "classical_only" else base_far,
+            "selected_architecture": str(best["architecture"]),
+            "selected_threshold": float(best["threshold"]),
+            "validation_precision_pct": float(best["precision_pct"]),
+            "validation_recall_pct": float(best["recall_pct"]),
+            "validation_f1_pct": float(best["f1_pct"]),
+            "validation_far_pct": float(best["far_pct"]),
             "classical_baseline_f1_pct": base_f1,
             "classical_baseline_far_pct": base_far,
-            "validation_f1_gain_pct": gain if selected != "classical_only" else 0.0,
-            "validation_far_increment_pct": far_inc if selected != "classical_only" else 0.0,
-            "selection_reason": "validation_f1_gain" if selected != "classical_only" else "classical_retained_no_minimum_gain",
+            "validation_f1_gain_pct": float(best["aggregate_gain_pct"]),
+            "validation_far_increment_pct": float(best["far_increment_pct"]),
+            "positive_validation_runs": int(best["positive_runs"]),
+            "positive_run_improvement_fraction": float(best["improve_fraction"]),
+            "positive_run_nondegradation_fraction": float(best["nondegrade_fraction"]),
+            "median_positive_run_f1_gain_pct": float(best["median_gain_pct"]),
+            "p95_run_incremental_far_pct": float(best["p95_far_increment_pct"]),
+            "max_run_incremental_far_pct": float(best["max_far_increment_pct"]),
+            "robust_candidate": True,
+            "best_rejected_architecture": "",
+            "selection_reason": "validation_run_stable_f1_gain",
         })
+
     return pd.DataFrame(rows)
 
 
@@ -693,7 +905,23 @@ def run(cfg, global_cfg, out_dir):
     max_hybrid_incremental_far = float(model_cfg.get("hybrid_max_incremental_far_pct", 1.0))
     heterogeneous_enabled = bool(model_cfg.get("heterogeneous_hybrid_enabled", True))
     heterogeneous_min_gain = float(model_cfg.get("heterogeneous_min_validation_f1_gain_pct", 0.25))
+    heterogeneous_min_improve_fraction = float(
+        model_cfg.get("heterogeneous_min_positive_run_improvement_fraction", 0.60)
+    )
+    heterogeneous_min_nondegrade_fraction = float(
+        model_cfg.get("heterogeneous_min_positive_run_nondegradation_fraction", 0.75)
+    )
+    heterogeneous_f1_degradation_tolerance = float(
+        model_cfg.get("heterogeneous_f1_degradation_tolerance_pct", 0.25)
+    )
+    heterogeneous_max_run_far_increment = float(
+        model_cfg.get("heterogeneous_max_per_run_incremental_far_pct", 2.0)
+    )
+    heterogeneous_max_p95_far_increment = float(
+        model_cfg.get("heterogeneous_max_p95_incremental_far_pct", 1.0)
+    )
     inference_batch = int(model_cfg.get("inference_batch_size", 1024))
+    validation_records_by_arch: dict[str, list[dict]] = {}
 
     for arch in [str(x).lower() for x in model_cfg.get("architectures", ["mlp", "cnn", "gru"])]:
         bundle, sensor_metrics = train_multilabel_fdir_model(
@@ -706,6 +934,7 @@ def run(cfg, global_cfg, out_dir):
         # sequences AFTER the exact runtime EWMA + persistence + arming/eclipse
         # reset logic. This removes the v1 raw-window/runtime mismatch.
         val_records = _threshold_records_for_bundle(bundle, sequences, threshold_calibration_run_ids, inference_batch)
+        validation_records_by_arch[arch] = val_records
         ml_th, ml_cal = choose_runtime_multilabel_thresholds(
             val_records, alpha=pr_alpha, persistence_samples=persist,
             reset_samples=reset_samples, max_false_alarm_rate_pct=max_ml_far,
@@ -754,8 +983,23 @@ def run(cfg, global_cfg, out_dir):
     threshold_calibration_df = pd.concat(threshold_calibration_frames, ignore_index=True)
     _save_table(threshold_calibration_df, tables / "runtime_threshold_calibration")
 
+    validation_stability_df = _build_validation_stability_table(
+        bundles, validation_records_by_arch, run_family_lookup,
+        alpha=pr_alpha,
+        persistence_samples=persist,
+        reset_samples=reset_samples,
+    )
+    _save_table(validation_stability_df, tables / "heterogeneous_hybrid_validation_run_stability")
+
     heterogeneous_selection = _select_validation_heterogeneous_hybrid(
-        threshold_calibration_df, min_f1_gain_pct=heterogeneous_min_gain,
+        threshold_calibration_df,
+        validation_stability_df,
+        min_f1_gain_pct=heterogeneous_min_gain,
+        min_positive_run_improvement_fraction=heterogeneous_min_improve_fraction,
+        min_positive_run_nondegradation_fraction=heterogeneous_min_nondegrade_fraction,
+        f1_degradation_tolerance_pct=heterogeneous_f1_degradation_tolerance,
+        max_per_run_incremental_far_pct=heterogeneous_max_run_far_increment,
+        max_p95_incremental_far_pct=heterogeneous_max_p95_far_increment,
     )
     if not heterogeneous_enabled:
         heterogeneous_selection["selected_architecture"] = "classical_only"
@@ -763,6 +1007,7 @@ def run(cfg, global_cfg, out_dir):
         heterogeneous_selection["selection_reason"] = "disabled_in_config"
         heterogeneous_selection["validation_f1_gain_pct"] = 0.0
         heterogeneous_selection["validation_far_increment_pct"] = 0.0
+        heterogeneous_selection["robust_candidate"] = False
     _save_table(heterogeneous_selection, tables / "heterogeneous_hybrid_sensor_selection")
     heterogeneous_arch_by_sensor = dict(zip(
         heterogeneous_selection["sensor"], heterogeneous_selection["selected_architecture"]
@@ -778,6 +1023,7 @@ def run(cfg, global_cfg, out_dir):
 
     # Held-out mission-like evaluation sweep.
     eval_cfg = cfg.get("evaluation", {})
+    save_timeseries = bool(cfg.get("save_timeseries", True))
     duration_eval = float(eval_cfg.get("duration_s", 1600.0))
     eval_seed = int(eval_cfg.get("seed", 13001))
     eval_repeats = max(1, int(eval_cfg.get("repeats", 4)))
@@ -869,31 +1115,32 @@ def run(cfg, global_cfg, out_dir):
                         **metrics,
                     })
 
-            frame = pd.DataFrame({
-                "case_id": ci, "repeat_id": repeat_id, "matched_seed": matched_seed,
-                "match_group": match_group,
-                "case_name": case["name"], "fault_family": case["family"],
-                "time_s": t, "fdir_armed": armed.astype(int),
-                "sun_expected_unavailable": expected_sun.astype(int),
-                "illumination_fraction": seq["illumination"], "eclipse_state": seq["eclipse_state"],
-                "truth_gyro_fault": truth[:, 0].astype(int), "truth_sun_fault": truth[:, 1].astype(int), "truth_mag_fault": truth[:, 2].astype(int),
-                "classical_gyro_detected": classical[:, 0].astype(int), "classical_sun_detected": classical[:, 1].astype(int), "classical_mag_detected": classical[:, 2].astype(int),
-                "hard_gyro_unavailable": hard[:, 0].astype(int), "hard_sun_unavailable": hard[:, 1].astype(int), "hard_mag_unavailable": hard[:, 2].astype(int),
-                "sun_pointing_error_deg": seq["pointing_error_deg"], "attitude_error_deg": seq["attitude_error_deg"],
-            })
-            for arch in bundles:
-                p = prob_by_arch[arch]; sm = smooth_by_arch[arch]; md = ml_det_by_arch[arch]
-                hy = hybrid_by_arch[arch]; aug = hybrid_aug_by_arch[arch]
+            if save_timeseries:
+                frame = pd.DataFrame({
+                    "case_id": ci, "repeat_id": repeat_id, "matched_seed": matched_seed,
+                    "match_group": match_group,
+                    "case_name": case["name"], "fault_family": case["family"],
+                    "time_s": t, "fdir_armed": armed.astype(int),
+                    "sun_expected_unavailable": expected_sun.astype(int),
+                    "illumination_fraction": seq["illumination"], "eclipse_state": seq["eclipse_state"],
+                    "truth_gyro_fault": truth[:, 0].astype(int), "truth_sun_fault": truth[:, 1].astype(int), "truth_mag_fault": truth[:, 2].astype(int),
+                    "classical_gyro_detected": classical[:, 0].astype(int), "classical_sun_detected": classical[:, 1].astype(int), "classical_mag_detected": classical[:, 2].astype(int),
+                    "hard_gyro_unavailable": hard[:, 0].astype(int), "hard_sun_unavailable": hard[:, 1].astype(int), "hard_mag_unavailable": hard[:, 2].astype(int),
+                    "sun_pointing_error_deg": seq["pointing_error_deg"], "attitude_error_deg": seq["attitude_error_deg"],
+                })
+                for arch in bundles:
+                    p = prob_by_arch[arch]; sm = smooth_by_arch[arch]; md = ml_det_by_arch[arch]
+                    hy = hybrid_by_arch[arch]; aug = hybrid_aug_by_arch[arch]
+                    for j, sensor in enumerate(SENSORS):
+                        frame[f"{arch}_{sensor}_probability"] = p[:, j]
+                        frame[f"{arch}_{sensor}_probability_ewma"] = sm[:, j]
+                        frame[f"ml_{arch}_{sensor}_detected"] = md[:, j].astype(int)
+                        frame[f"hybrid_{arch}_{sensor}_ml_augmentation"] = aug[:, j].astype(int)
+                        frame[f"hybrid_{arch}_{sensor}_detected"] = hy[:, j].astype(int)
                 for j, sensor in enumerate(SENSORS):
-                    frame[f"{arch}_{sensor}_probability"] = p[:, j]
-                    frame[f"{arch}_{sensor}_probability_ewma"] = sm[:, j]
-                    frame[f"ml_{arch}_{sensor}_detected"] = md[:, j].astype(int)
-                    frame[f"hybrid_{arch}_{sensor}_ml_augmentation"] = aug[:, j].astype(int)
-                    frame[f"hybrid_{arch}_{sensor}_detected"] = hy[:, j].astype(int)
-            for j, sensor in enumerate(SENSORS):
-                frame[f"hybrid_validation_selected_{sensor}_ml_augmentation"] = heterogeneous_aug[:, j].astype(int)
-                frame[f"hybrid_validation_selected_{sensor}_detected"] = heterogeneous_hybrid[:, j].astype(int)
-            timeseries_rows.append(frame)
+                    frame[f"hybrid_validation_selected_{sensor}_ml_augmentation"] = heterogeneous_aug[:, j].astype(int)
+                    frame[f"hybrid_validation_selected_{sensor}_detected"] = heterogeneous_hybrid[:, j].astype(int)
+                timeseries_rows.append(frame)
 
             if repeat_id == 0 and bool(cfg.get("plots_enabled", True)) and case["name"] in representative:
                 _plot_probability_timeline(
@@ -974,15 +1221,22 @@ def run(cfg, global_cfg, out_dir):
         ax.legend(fontsize=7, ncol=4)
         finalize_figure(fig, plots / "ml_fdir_macro_f1_by_fault_category", formats=tuple(global_cfg["visualization"]["formats"]), dpi=int(global_cfg["visualization"]["dpi"]))
 
-    # Timeseries can be large: write it once, zip it, and optionally remove CSV.
-    ts = pd.concat(timeseries_rows, ignore_index=True)
-    ts_csv = out / "reaction_wheel_ml_fdir_campaign_timeseries.csv"
-    ts.to_csv(ts_csv, index=False)
-    ts_zip = out / "reaction_wheel_ml_fdir_campaign_timeseries.zip"
-    with zipfile.ZipFile(ts_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-        zf.write(ts_csv, arcname=ts_csv.name)
-    if not bool(cfg.get("keep_uncompressed_timeseries", False)):
-        ts_csv.unlink(missing_ok=True)
+    # Timeseries can be large. The thesis-results orchestrator can disable them
+    # because all detector metrics and publication plots are already retained.
+    if save_timeseries and timeseries_rows:
+        ts = pd.concat(timeseries_rows, ignore_index=True)
+        ts_csv = out / "reaction_wheel_ml_fdir_campaign_timeseries.csv"
+        ts.to_csv(ts_csv, index=False)
+        ts_zip = out / "reaction_wheel_ml_fdir_campaign_timeseries.zip"
+        with zipfile.ZipFile(ts_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            zf.write(ts_csv, arcname=ts_csv.name)
+        if not bool(cfg.get("keep_uncompressed_timeseries", False)):
+            ts_csv.unlink(missing_ok=True)
+    else:
+        (out / "timeseries_omitted.txt").write_text(
+            "Full ML-FDIR evaluation timeseries disabled by save_timeseries=false; all metrics, selection tables and figures were retained.",
+            encoding="utf-8",
+        )
 
     metrics_df.to_csv(out / "reaction_wheel_ml_fdir_campaign_metrics.csv", index=False)
     case_agg.to_csv(out / "reaction_wheel_ml_fdir_campaign_summary.csv", index=False)
@@ -998,9 +1252,16 @@ def run(cfg, global_cfg, out_dir):
         "hybrid_definition": "complete classical v3.1 decision (hard + soft) OR validation-gated ML augmentation; ML augmentation is calibrated to add at most the configured incremental FAR",
         "heterogeneous_hybrid": {
             "selection_domain": "complete validation sequences only",
+            "selection_rule": "aggregate FAR-constrained threshold + run-level stability constraints",
             "minimum_validation_f1_gain_pct": heterogeneous_min_gain,
+            "minimum_positive_run_improvement_fraction": heterogeneous_min_improve_fraction,
+            "minimum_positive_run_nondegradation_fraction": heterogeneous_min_nondegrade_fraction,
+            "f1_degradation_tolerance_pct": heterogeneous_f1_degradation_tolerance,
+            "maximum_per_run_incremental_far_pct": heterogeneous_max_run_far_increment,
+            "maximum_p95_incremental_far_pct": heterogeneous_max_p95_far_increment,
             "selected_architecture_by_sensor": heterogeneous_arch_by_sensor,
             "test_set_used_for_selection": False,
+            "held_out_evaluation_used_for_selection": False,
         },
         "primary_metrics": ["precision", "recall", "F1", "false alarm rate", "episode detection probability", "detection delay"],
         "secondary_context": "Pointing/attitude errors are saved in the evaluation timeseries but recovery performance remains Experiment 1; Experiment 2 isolates the detection question.",

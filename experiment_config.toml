@@ -12,8 +12,8 @@ stop_on_error = true
 enabled = true
 formats = ["png", "pdf"]
 dpi = 300
-font_size = 15
-axes_linewidth = 2.0
+font_size = 16
+axes_linewidth = 2.2
 
 
 [animation]
@@ -74,7 +74,7 @@ scenario_ids = [0, 3, 8, 9]
 # Select one end-to-end operational scenario. Future scenarios are added to the registry
 # and chosen here without changing the command used to launch the project.
 enabled = true
-active = "reaction_wheel_ml_fdir_campaign"
+active = "thesis_results_campaign"
 
 [scenarios.sun_pointing]
 duration_s = 600.0
@@ -400,6 +400,49 @@ enabled = true
 # cases = ["high_beta_sunlit|magnetic_ltv"]
 cases = ["all"]
 eclipse_sun_sensor_unavailable = true
+
+
+# ==========================================================================
+# THESIS RESULTS CAMPAIGN
+# One command generates the curated figures/tables used in the Implementation
+# and Testing/Results chapters. It reuses the final project configuration and
+# does not change the final Experiment 1/2 methodology.
+# ==========================================================================
+[scenarios.thesis_results_campaign]
+run_orbit = true
+run_orekit_cross_verification = true
+# If Orekit is unavailable, set false to keep the remaining thesis plots running.
+# For the final thesis result, Orekit cross-verification should be enabled.
+require_orekit = false
+run_nominal_estimation = true
+run_aocs = true
+run_experiment1 = true
+run_experiment2 = true
+
+# Keep the curated result package compact. Component campaigns still save all
+# metric tables, trained models and selected publication plots, but omit their
+# multi-gigabyte raw timeseries unless explicitly enabled.
+save_component_timeseries = false
+save_nominal_timeseries = false
+component_plots_enabled = false
+
+# Nominal verification uses the same dt/inertia/sensor settings as the project.
+nominal_duration_s = 600.0
+nominal_dt_s = 0.1
+
+# Healthy closed-loop AOCS validation. The full orbit length captures eclipse,
+# wheel utilization and operational mode transitions.
+aocs_duration_s = 6000.0
+aocs_dt_s = 0.1
+aocs_orbit_profile = "global"
+aocs_magnetic_field_model = "igrf14"
+aocs_seed = 7301
+
+# Leave empty to use all configured Orekit verification cases.
+orekit_case_names = []
+
+# Experiment 1 currently uses the final D multi-sensor campaign.
+experiment1_groups = ["D"]
 
 [steps]
 # Diagnostic package default: run the controller × orbit matrix only.
@@ -1234,6 +1277,14 @@ hybrid_max_incremental_far_pct = 1.0
 # improves validation F1 by at least this margin, classical-only is retained.
 heterogeneous_hybrid_enabled = true
 heterogeneous_min_validation_f1_gain_pct = 0.25
+# Run-level robustness gates for architecture selection. A candidate must improve
+# a majority of positive-fault validation trajectories and must not hide a large
+# false-alarm spike inside an acceptable aggregate FAR.
+heterogeneous_min_positive_run_improvement_fraction = 0.60
+heterogeneous_min_positive_run_nondegradation_fraction = 0.75
+heterogeneous_f1_degradation_tolerance_pct = 0.25
+heterogeneous_max_per_run_incremental_far_pct = 2.0
+heterogeneous_max_p95_incremental_far_pct = 1.0
 
 [scenarios.reaction_wheel_ml_fdir_campaign.models.training]
 epochs = 20
@@ -1309,10 +1360,12 @@ vector_reacquisition_consistency_samples = 10
 # one repeat all severity levels share pre-fault orbit/attitude/noise/fault RNG.
 # Post-fault trajectories may diverge naturally because severity changes the loop.
 duration_s = 1600.0
-repeats = 4
+# Fresh final held-out evaluation. These seeds were not used in any previous run
+# and are intentionally changed after freezing the run-level selection rule.
+repeats = 6
 fault_start_s = 300.0
 fault_end_s = 1400.0
-seed = 13001
+seed = 17011
 initial_attitude_error_max_deg = 20.0
 body_rate_max_rad_s = 0.003
 

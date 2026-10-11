@@ -213,6 +213,11 @@ def _generated_cases(cfg):
 def run(cfg,global_cfg,out_dir):
     out=Path(out_dir); out.mkdir(parents=True,exist_ok=True); plots=out/'plots'; plots.mkdir(exist_ok=True); tables=out/'tables'; tables.mkdir(exist_ok=True); models_dir=out/'models'; models_dir.mkdir(exist_ok=True)
     animations=out/'animations'; animations.mkdir(exist_ok=True)
+    # Large campaign timeseries are useful for forensic analysis but are not required
+    # when this scenario is called from the thesis-results orchestrator. Disabling
+    # them avoids multi-gigabyte intermediate files while preserving all metrics,
+    # trained models and publication figures.
+    save_timeseries=bool(cfg.get('save_timeseries',True))
 
     base=copy.deepcopy(global_cfg['scenarios']['reaction_wheel_sun_pointing_comparison'])
     duration=float(cfg.get('duration_s',base.get('duration_s',6000.))); dt=float(cfg.get('dt_s',base.get('dt_s',.1))); base['duration_s']=duration; base['dt_s']=dt
@@ -310,7 +315,8 @@ def run(cfg,global_cfg,out_dir):
                 else:
                     row[f'fdir_{sensor}_precision_pct']=np.nan; row[f'fdir_{sensor}_f1_pct']=np.nan; row[f'fdir_{sensor}_mean_detection_delay_s']=np.nan
             summary_rows.append(row)
-            ts_rows.append(pd.DataFrame({'case_id':ci,'case_name':cname,'branch':branch,'architecture':arch,'variant':variant,'time_s':t,'fault_active':fmask.astype(int),'sun_visible':sunlight.astype(int),'primary_metric_mask':primary.astype(int),'illumination_fraction':illum,'eclipse_state':eclipse_state,'true_sun_pointing_error_deg':point,'attitude_estimation_error_deg':att,'body_rate_deg_s':rate,'adcs_mode':r['mode'],'ml_recovery_active':r['ml_used'].astype(int),'ml_sun_used':r['ml_sun_used'].astype(int),'ml_gyro_used':r['ml_gyro_used'].astype(int),'ml_mag_used':r['ml_mag_used'].astype(int),'ml_sun_rejected':r['ml_sun_rejected'].astype(int),'ml_gyro_rejected':r['ml_gyro_rejected'].astype(int),'ml_mag_rejected':r['ml_mag_rejected'].astype(int),
+            if save_timeseries:
+                ts_rows.append(pd.DataFrame({'case_id':ci,'case_name':cname,'branch':branch,'architecture':arch,'variant':variant,'time_s':t,'fault_active':fmask.astype(int),'sun_visible':sunlight.astype(int),'primary_metric_mask':primary.astype(int),'illumination_fraction':illum,'eclipse_state':eclipse_state,'true_sun_pointing_error_deg':point,'attitude_estimation_error_deg':att,'body_rate_deg_s':rate,'adcs_mode':r['mode'],'ml_recovery_active':r['ml_used'].astype(int),'ml_sun_used':r['ml_sun_used'].astype(int),'ml_gyro_used':r['ml_gyro_used'].astype(int),'ml_mag_used':r['ml_mag_used'].astype(int),'ml_sun_rejected':r['ml_sun_rejected'].astype(int),'ml_gyro_rejected':r['ml_gyro_rejected'].astype(int),'ml_mag_rejected':r['ml_mag_rejected'].astype(int),
                 'fdir_mode':r['fdir_mode'],'fdir_armed':r['fdir_armed'].astype(int),'fdir_gyro_confidence':r['fdir_conf_gyro'],'fdir_sun_confidence':r['fdir_conf_sun'],'fdir_mag_confidence':r['fdir_conf_mag'],
                 'fdir_gyro_state':r['fdir_state_gyro'],'fdir_sun_state':r['fdir_state_sun'],'fdir_mag_state':r['fdir_state_mag'],
                 'fdir_gyro_detected':r['fdir_detected_gyro'].astype(int),'fdir_sun_detected':r['fdir_detected_sun'].astype(int),'fdir_mag_detected':r['fdir_detected_mag'].astype(int),
@@ -339,7 +345,8 @@ def run(cfg,global_cfg,out_dir):
             for branch,arch,variant,label in specs:
                 r=results[branch]; create_orbit_attitude_animation(animations/f'{ci:02d}_{_slug(cname)}_{branch}.html',t,r['truth'][:,:4],r['qhat'],altitude_m=float(orbit_meta['altitude_m']),inclination_deg=float(orbit_meta['inclination_deg']),raan_deg=float(orbit_meta['raan_deg']),phase_deg=float(orbit_meta.get('phase_deg',0.0)),fault_name=_fault_description(case) if branch!='healthy_mekf' else 'none',severity='fair_comparison',fault_start_s=float(case.get('start_s',0.)) if branch!='healthy_mekf' else None,fault_end_s=float(case.get('end_s',duration)) if branch!='healthy_mekf' else None,title=f'{cname} — {label}',mode_series=r['mode'],body_rate_deg_s=np.degrees(np.linalg.norm(r['truth'][:,4:],axis=1)),**kwargs)
 
-    summary=pd.DataFrame(summary_rows); ts=pd.concat(ts_rows,ignore_index=True)
+    summary=pd.DataFrame(summary_rows)
+    ts=pd.concat(ts_rows,ignore_index=True) if save_timeseries and ts_rows else None
     # Improvements relative to Faulty and FDIR baselines use the primary sunlight-only metric.
     summary['pointing_improvement_vs_faulty_pct']=np.nan; summary['pointing_improvement_vs_fdir_pct']=np.nan
     for cname,g in summary.groupby('case_name'):
@@ -351,8 +358,13 @@ def run(cfg,global_cfg,out_dir):
             p0=float(fd.iloc[0].sunlight_fault_pointing_rmse_deg); mlx=g[~g.branch.isin(BASE_BRANCHES)].index
             if np.isfinite(p0) and abs(p0)>1e-12: summary.loc[mlx,'pointing_improvement_vs_fdir_pct']=100*(p0-summary.loc[mlx,'sunlight_fault_pointing_rmse_deg'])/p0
 
-    summary.to_csv(out/'reaction_wheel_fair_ml_campaign_summary.csv',index=False); ts.to_csv(out/'reaction_wheel_fair_ml_campaign_timeseries.csv',index=False)
-    summary.to_csv(out.parent/'reaction_wheel_fair_ml_campaign_summary.csv',index=False); ts.to_csv(out.parent/'reaction_wheel_fair_ml_campaign_timeseries.csv',index=False)
+    summary.to_csv(out/'reaction_wheel_fair_ml_campaign_summary.csv',index=False)
+    summary.to_csv(out.parent/'reaction_wheel_fair_ml_campaign_summary.csv',index=False)
+    if ts is not None:
+        ts.to_csv(out/'reaction_wheel_fair_ml_campaign_timeseries.csv',index=False)
+        ts.to_csv(out.parent/'reaction_wheel_fair_ml_campaign_timeseries.csv',index=False)
+    else:
+        (out/'timeseries_omitted.txt').write_text('Full campaign timeseries disabled by save_timeseries=false; all summary metrics and figures were retained.',encoding='utf-8')
 
     # Thesis-ready tables.
     primary_cols=['case_name','fault_group','fault_description','branch','architecture','variant','sunlight_fault_pointing_rmse_deg','sunlight_fault_attitude_rmse_deg','sunlight_fault_p_over_2deg_pct','sunlight_fault_p_over_5deg_pct','recovery_time_s','pointing_improvement_vs_faulty_pct','pointing_improvement_vs_fdir_pct']

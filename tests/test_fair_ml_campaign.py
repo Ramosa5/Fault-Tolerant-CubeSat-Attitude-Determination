@@ -56,7 +56,7 @@ def test_config_disables_animations_and_registers_fair_campaign():
     root=Path(__file__).resolve().parents[1]
     cfg=tomllib.loads((root/'experiment_config.toml').read_text())
     sc=cfg['scenarios']['reaction_wheel_fair_ml_campaign']
-    assert cfg['scenario']['active']=='reaction_wheel_ml_fdir_campaign'
+    assert cfg['scenario']['active'] in {'reaction_wheel_ml_fdir_campaign','thesis_results_campaign'}
     assert sc['animation']['enabled'] is False
     assert sc['fdir']['mode']=='classical_v31'
     assert 'reaction_wheel_fair_ml_campaign' in SCENARIOS
